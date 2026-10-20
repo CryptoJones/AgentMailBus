@@ -25,7 +25,8 @@ SEND_TOOL = {
     "description": (
         "Send a message to a named agent. The relay delivers it. "
         "You do not receive messages with a tool. "
-        "Every failure names the message id it used; retry with that id so the message is not sent twice."
+        "A failure names the message id it used and says whether to retry with that id "
+        "(outcome unknown) or to send a new message (that one can never be delivered)."
     ),
     "inputSchema": {
         "type": "object",
@@ -132,12 +133,13 @@ def _call(mid, params: dict, sender: str, rpc) -> dict:
     }
 
 
-# Errors that the same message can never get past. Retrying them with the same id
-# would fail the same way; the id is named for the record only.
+# Errors that the same message can never get past: the broker gave up on it, the id
+# belongs to another message, the recipient does not exist, or the message itself is
+# invalid. Everything else describes the moment (relay down, session not registered
+# yet, answer lost) and the same id is the right retry.
 TERMINAL = {
-    "delivery-failed", "id-conflict", "unknown-agent", "sender-offline", "not-registered",
-    "not-your-agent", "bad-name", "bad-text", "empty-text", "too-large", "bad-priority",
-    "bad-id", "unknown-tool", "bad-arguments",
+    "delivery-failed", "id-conflict", "unknown-agent",
+    "bad-name", "bad-text", "empty-text", "too-large", "bad-priority",
 }
 
 

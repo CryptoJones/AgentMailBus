@@ -127,29 +127,27 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         ensure_ascii=False,
     )
     data = memoryview((line + "\n").encode())
-    # O_NONBLOCK keeps a FIFO without a reader from hanging the open, O_NOFOLLOW
-    # refuses a symlink in the file's place, and the fstat check is what guarantees
-    # the bytes land in a regular file. A file this call creates is 0600 from the
-    # open itself (umask can only remove bits), so nothing is chmodded by name.
-    flags = (
-        os.O_APPEND
-        | os.O_CREAT
-        | os.O_WRONLY
-        | getattr(os, "O_NONBLOCK", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        fd = os.open(path, flags, 0o600)
-    except OSError:
+    fd = _open_wake(path)
+    if fd is None:
         return False
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return False
-        while data:
-            written = os.write(fd, data)
-            if written <= 0:
-                raise OSError("short write")
-            data = data[written:]
+        start = os.fstat(fd).st_size
+        try:
+            while data:
+                written = os.write(fd, data)
+                if written <= 0:
+                    raise OSError("short write")
+                data = data[written:]
+        except OSError:
+            # A torn line must not stay in the file ahead of the retry.
+            try:
+                os.ftruncate(fd, start)
+            except OSError:
+                log.warning("partial wake line left in %s", path)
+                return True
+            raise
         try:
             os.fsync(fd)
         except OSError as exc:
@@ -157,8 +155,33 @@ def deliver_wake(binding: dict, message: dict) -> bool:
             # append it twice, so this is a delivered message with a logged sync error.
             log.warning("fsync failed for %s: %s", path, type(exc).__name__)
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            log.warning("close failed for %s: %s", path, type(exc).__name__)
     return True
+
+
+def _open_wake(path: Path) -> int | None:
+    """Open the wake file for append. A file created here is made 0600 through its
+    descriptor, whatever the umask. O_NONBLOCK keeps a FIFO without a reader from
+    hanging the open; O_NOFOLLOW refuses a symlink in the file's place."""
+    base = os.O_APPEND | os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, base | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            return os.open(path, base)
+        except OSError:
+            return None
+    except OSError:
+        return None
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
 
 
 def deliver_dsh(binding: dict, message: dict) -> bool:

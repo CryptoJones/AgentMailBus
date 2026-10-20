@@ -12,8 +12,10 @@ from agentmailbus.paths import private_dir
 MAX_ATTEMPTS = 20
 MAX_BACKOFF = 60.0
 # A delivered row with no ack or nack after this long counts as a failed attempt.
-# Adapters time out in 5 s and the OMI note in 30 s, so a live relay answers well inside it.
-DELIVERY_TIMEOUT = 120.0
+# The relay runs one delivery worker per name, so the clock covers one delivery for
+# that name: at most two 5 s socket timeouts, or a wake-file write, plus a 30 s OMI
+# note left over from the previous message. A live relay answers well inside it.
+DELIVERY_TIMEOUT = 300.0
 RETENTION_DAYS = 7
 # The relay remembers ids longer than the broker keeps finished rows, so a row the
 # broker requeues after a long outage is still recognised. See PROTOCOL.md.
@@ -49,7 +51,9 @@ def _open(path: Path) -> sqlite3.Connection:
 
 
 class BrokerStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, delivery_timeout: float = DELIVERY_TIMEOUT) -> None:
+        self.delivery_timeout = delivery_timeout
+        self.claims = 0
         self.conn = _open(path)
         self.conn.executescript(
             """
@@ -183,15 +187,17 @@ class BrokerStore:
     def due(self, row: dict) -> bool:
         return row["state"] == "queued" and row["not_before"] <= _now()
 
-    def stale(self, row: dict, timeout: float = DELIVERY_TIMEOUT) -> bool:
+    def stale(self, row: dict) -> bool:
         """A delivered row whose ack or nack is overdue."""
-        return row["state"] == "delivered" and row["delivered_at"] < _before(timeout / 86400.0)
+        return row["state"] == "delivered" and row["delivered_at"] < _before(self.delivery_timeout / 86400.0)
 
     def claim(self, mid: str) -> str | None:
         """Move one queued row to delivered. Returns the claim stamp, or None when
         another path already took it. The stamp lets a failed send roll back only
-        its own claim and not a newer one."""
-        stamp = _now()
+        its own claim and not a newer one; the counter makes it unique even if the
+        clock repeats."""
+        self.claims += 1
+        stamp = f"{_now()}/{self.claims}"
         cur = self.conn.execute(
             "UPDATE messages SET state='delivered', delivered_at=? WHERE id=? AND state='queued'",
             (stamp, mid),
@@ -200,9 +206,14 @@ class BrokerStore:
         return stamp if cur.rowcount == 1 else None
 
     def ack(self, mid: str) -> None:
+        """An ack always means the relay wrote the message. It finishes the row even
+        if the broker has meanwhile counted it as overdue and requeued it."""
         if mid:
             self.conn.execute(
-                "UPDATE messages SET state='acked', finished_at=? WHERE id=? AND state='delivered'",
+                """
+                UPDATE messages SET state='acked', finished_at=?
+                WHERE id=? AND (state='delivered' OR (state='queued' AND attempts > 0))
+                """,
                 (_now(), mid),
             )
             self.conn.commit()

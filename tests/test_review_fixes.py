@@ -135,6 +135,12 @@ def test_mcp_retry_reuses_the_id() -> None:
     )
     assert terminal[0]["result"]["content"][0]["text"] == f"delivery-failed (message id {mid}; not retryable as is, send a new message with a new id)"
     assert terminal[1]["result"]["content"][0]["text"].startswith(f"bad-name (message id {mid}")
+    # A condition of the moment is not terminal: the same id is the right retry.
+    moment = _mcp_session(
+        [{"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}}],
+        lambda payload: {"ok": False, "error": "not-registered"},
+    )
+    assert moment[0]["result"]["content"][0]["text"] == f"not-registered (message id {mid}; outcome unknown, retry with this id)"
     # A reply whose id cannot be UTF-8 is escaped, not a crash.
     odd = _mcp_session([{"jsonrpc": "2.0", "id": "\ud800", "method": "ping"}], lambda p: {})
     assert odd[0]["id"] == "\ud800" and odd[0]["result"] == {}
@@ -339,6 +345,20 @@ def test_existing_directories_keep_their_mode(tmp_path: Path) -> None:
     os.chmod(wake, 0o644)
     assert deliver_wake({"wake": str(wake)}, {"id": "m2", "from": "a", "from_host": "h", "to": "b", "text": "t"})
     assert (wake.stat().st_mode & 0o777) == 0o644
+
+
+def test_wake_file_is_private_whatever_the_umask(tmp_path: Path) -> None:
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    old = os.umask(0o777)
+    try:
+        wake = tmp_path / "w.jsonl"
+        assert deliver_wake({"wake": str(wake)}, msg)
+        assert (wake.stat().st_mode & 0o777) == 0o600
+        assert wake.read_text().count("\n") == 1
+        assert deliver_wake({"wake": str(wake)}, msg)  # and the second open works too
+        assert wake.read_text().count("\n") == 2
+    finally:
+        os.umask(old)
 
 
 def test_wake_file_must_be_a_regular_file(tmp_path: Path) -> None:
@@ -621,11 +641,19 @@ async def _worker(tmp_path: Path) -> None:
         # acked, never handed back for a second injection.
         await _until(lambda: broker.store.get_message(boom)["state"] == "acked")
         assert broker.store.get_message(boom)["attempts"] == 0
+        # The id is held in memory: a replay of the same frame is acked without a second write.
+        assert boom in relay.seen_fallback
+        before = len(rec.messages)
+        await relay._deliver({"type": "deliver", "id": boom, "to": "alpha", "from": "alpha", "text": "boom"})
+        assert len(rec.messages) == before
+        # Once the store works again the held id is written into it.
+        assert not relay.seen.done(boom)
         # The worker is still alive and the next message gets through, exactly once each.
         await relay.local_send("alpha", "alpha", "next")
         await _until(lambda: "next" in rec.texts())
         await asyncio.sleep(0.3)
         assert rec.texts().count("boom") == 1 and rec.texts().count("next") == 1
+        assert relay.seen.done(boom) and boom not in relay.seen_fallback
         assert "host-a" in broker.conns
         # A failure before the write is handed back and retried.
         real_done = relay.seen.done
@@ -679,6 +707,72 @@ async def _frames(tmp_path: Path) -> None:
         for ws in idle:
             await ws.close()
         await _until(lambda: broker.pending.get("127.0.0.1", 0) == 0)
+
+        await relay.close()
+        await task
+    finally:
+        await broker.stop()
+
+
+def test_mesh_lost_ack_and_slow_neighbour(tmp_path: Path) -> None:
+    asyncio.run(_lost_ack(tmp_path))
+
+
+async def _lost_ack(tmp_path: Path) -> None:
+    store = BrokerStore(tmp_path / "broker.db", delivery_timeout=1.0)
+    broker = Broker(store, "tok", parse_allow(["127.0.0.0/8"]), "127.0.0.1", 0)
+    await broker.start()
+    rec = Recording()
+    try:
+        relay, task = await _relay(tmp_path, "host-a", "alpha", broker.port, rec)
+        _bind(relay.registry, "gamma")
+        await _settled(relay, "alpha")
+        await _settled(relay, "gamma")
+
+        # The relay writes but its ack is lost. The broker's deadline hands the row back,
+        # the resend hits the seen set, and the second ack finishes it: one injection.
+        real_ack = relay._ack
+        dropped = []
+
+        async def drop_first(mid):
+            if not dropped:
+                dropped.append(mid)
+                return
+            await real_ack(mid)
+
+        relay._ack = drop_first
+        lost = str(uuid.uuid4())
+        await relay.local_send("alpha", "gamma", "lost", mid=lost)
+        await _until(lambda: dropped == [lost])
+        await _until(lambda: store.get_message(lost)["attempts"] == 1, seconds=6)
+        await _until(lambda: store.get_message(lost)["state"] == "acked", seconds=8)
+        assert rec.texts().count("lost") == 1
+        relay._ack = real_ack
+
+        # A late ack on a row the broker already handed back still finishes it.
+        late = str(uuid.uuid4())
+        store.insert_message(late, "alpha", "gamma", "late", "next")
+        store.claim(late)
+        store.nack(late)
+        assert store.get_message(late)["state"] == "queued"
+        await relay.ws.send(dumps({"type": "ack", "id": late}))
+        await _until(lambda: store.get_message(late)["state"] == "acked")
+
+        # One slow name does not hold another name's delivery.
+
+        def deliver(binding, message):
+            if message["to"] == "alpha":
+                import time as _t
+
+                _t.sleep(1.2)
+            return rec.deliver(binding, message)
+
+        relay.adapters = {k: deliver for k in relay.adapters}
+        await relay.local_send("gamma", "alpha", "slow-one")
+        await relay.local_send("alpha", "gamma", "quick-one")
+        await _until(lambda: "quick-one" in rec.texts(), seconds=1.0)
+        assert "slow-one" not in rec.texts()
+        await _until(lambda: "slow-one" in rec.texts(), seconds=3)
 
         await relay.close()
         await task
