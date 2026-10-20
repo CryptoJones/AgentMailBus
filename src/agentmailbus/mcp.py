@@ -1,6 +1,7 @@
 """Stdio MCP server. The only tool is send. Receiving is the relay's job.
 
-MCP stdio framing is one JSON-RPC object per line, no headers.
+MCP stdio framing is one JSON-RPC object per line, no headers. A line may also hold a
+JSON array (a batch); the reply is then an array.
 """
 
 from __future__ import annotations
@@ -8,9 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import uuid
 
 from agentmailbus import __version__
-from agentmailbus.protocol import ProtocolError, check_name, check_priority, check_text
+from agentmailbus.protocol import MAX_FRAME, ProtocolError, check_id, check_name, check_priority, check_text
 
 log = logging.getLogger("agentmailbus.mcp")
 
@@ -20,7 +22,8 @@ SEND_TOOL = {
     "name": "send",
     "description": (
         "Send a message to a named agent. The relay delivers it. "
-        "You do not receive messages with a tool."
+        "You do not receive messages with a tool. "
+        "If a call fails with an id in the error, retry with that id so the message is not sent twice."
     ),
     "inputSchema": {
         "type": "object",
@@ -31,6 +34,10 @@ SEND_TOOL = {
                 "type": "string",
                 "enum": ["next", "now", "later"],
                 "description": "Claude delivery priority. Other harnesses ignore it.",
+            },
+            "id": {
+                "type": "string",
+                "description": "Optional UUID. Reuse the id from a failed call to retry it as the same message.",
             },
         },
         "required": ["to", "text"],
@@ -44,8 +51,11 @@ def handle_request(msg: dict, sender: str, rpc) -> dict | None:
     if mid is None:
         return None
     method = msg.get("method")
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        params = {}
     if method == "initialize":
-        asked = (msg.get("params") or {}).get("protocolVersion")
+        asked = params.get("protocolVersion")
         version = asked if asked in SUPPORTED_VERSIONS else SUPPORTED_VERSIONS[0]
         return {
             "jsonrpc": "2.0",
@@ -61,7 +71,7 @@ def handle_request(msg: dict, sender: str, rpc) -> dict | None:
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [SEND_TOOL]}}
     if method == "tools/call":
-        return _call(mid, msg.get("params") or {}, sender, rpc)
+        return _call(mid, params, sender, rpc)
     return {
         "jsonrpc": "2.0",
         "id": mid,
@@ -72,29 +82,41 @@ def handle_request(msg: dict, sender: str, rpc) -> dict | None:
 def _call(mid, params: dict, sender: str, rpc) -> dict:
     if params.get("name") != "send":
         return _tool_error(mid, "unknown-tool")
-    args = params.get("arguments") or {}
+    args = params.get("arguments")
+    if not isinstance(args, dict):
+        return _tool_error(mid, "bad-arguments")
     try:
         recipient = check_name(args.get("to"), "to")
         text = check_text(args.get("text"))
         priority = check_priority(args.get("priority"))
+        msg_id = check_id(args["id"]) if args.get("id") else str(uuid.uuid4())
     except ProtocolError as exc:
         return _tool_error(mid, exc.code)
+    payload = {
+        "op": "send",
+        "id": msg_id,
+        "from": sender,
+        "to": recipient,
+        "text": text,
+        "priority": priority,
+    }
     try:
-        result = rpc(
-            {"op": "send", "from": sender, "to": recipient, "text": text, "priority": priority}
-        )
+        result = rpc(payload)
     except (OSError, ProtocolError, ValueError) as exc:
         # The relay is down or restarting. The tool fails; the server stays up.
         log.warning("relay call failed: %s", type(exc).__name__)
-        return _tool_error(mid, "relay-down")
-    if not result.get("ok"):
-        return _tool_error(mid, str(result.get("error") or "send-failed"))
+        return _tool_error(mid, f"relay-down (retry with id {msg_id})")
+    if not isinstance(result, dict) or not result.get("ok"):
+        code = str((result or {}).get("error") or "send-failed") if isinstance(result, dict) else "send-failed"
+        if code in {"timeout", "broker-down"}:
+            code = f"{code} (retry with id {msg_id})"
+        return _tool_error(mid, code)
     state = "queued" if result.get("waiting") else "accepted"
     return {
         "jsonrpc": "2.0",
         "id": mid,
         "result": {
-            "content": [{"type": "text", "text": f"{result.get('id', '')} {state}"}],
+            "content": [{"type": "text", "text": f"{result.get('id', msg_id)} {state}"}],
         },
     }
 
@@ -107,19 +129,31 @@ def _tool_error(mid, code: str) -> dict:
     }
 
 
-def read_message(stream) -> dict | None:
-    """One JSON object per line. None at end of input. Raises JSONDecodeError on a bad line."""
+def _rpc_error(mid, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+def read_message(stream):
+    """One JSON value per line, at most MAX_FRAME bytes. None at end of input.
+
+    Raises ValueError (including JSONDecodeError) for a bad line; the over-long
+    remainder of such a line is discarded first so the stream stays in sync.
+    """
     while True:
-        line = stream.readline()
+        line = stream.readline(MAX_FRAME + 1)
         if line == b"":
             return None
+        if len(line) > MAX_FRAME:
+            while line and not line.endswith(b"\n"):
+                line = stream.readline(MAX_FRAME + 1)
+            raise ValueError("too-large")
         line = line.strip()
         if not line:
             continue
         return json.loads(line)
 
 
-def write_message(stream, obj: dict) -> None:
+def write_message(stream, obj) -> None:
     stream.write((json.dumps(obj, ensure_ascii=False) + "\n").encode())
     stream.flush()
 
@@ -130,16 +164,29 @@ def serve_stdio(sender: str, rpc, stdin=None, stdout=None) -> None:
     while True:
         try:
             msg = read_message(stdin)
-        except json.JSONDecodeError:
-            write_message(
-                stdout,
-                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
-            )
+        except ValueError as exc:
+            code, text = (-32600, "request too large") if str(exc) == "too-large" else (-32700, "parse error")
+            write_message(stdout, _rpc_error(None, code, text))
             continue
         if msg is None:
             break
-        if not isinstance(msg, dict):
+        if isinstance(msg, list):
+            replies = [r for r in (_handle(m, sender, rpc) for m in msg) if r is not None]
+            if replies:
+                write_message(stdout, replies)
             continue
-        reply = handle_request(msg, sender, rpc)
+        reply = _handle(msg, sender, rpc)
         if reply is not None:
             write_message(stdout, reply)
+
+
+def _handle(msg, sender: str, rpc) -> dict | None:
+    if not isinstance(msg, dict):
+        return _rpc_error(None, -32600, "invalid request")
+    try:
+        return handle_request(msg, sender, rpc)
+    except Exception as exc:
+        # A malformed request must not end the server and drop the session binding.
+        log.warning("request failed: %s", type(exc).__name__)
+        mid = msg.get("id")
+        return None if mid is None else _rpc_error(mid, -32603, "internal error")

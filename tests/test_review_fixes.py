@@ -1,4 +1,4 @@
-"""One test per finding from the 2026-10-20 review of commit 2feb5bd."""
+"""One test per finding from the 2026-10-20 reviews of 2feb5bd and 9e786d9."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from agentmailbus.adapters import deliver_wake, escape_text
-from agentmailbus.broker import Broker
+from agentmailbus.broker import MAX_PENDING_PER_IP, Broker
 from agentmailbus.cli import _run_relay
 from agentmailbus.mcp import serve_stdio
 from agentmailbus.net import parse_allow
@@ -21,12 +21,13 @@ from agentmailbus.protocol import check_id, dumps
 from agentmailbus.registry import load_live, pid_alive, remove_binding, save_binding
 from agentmailbus.relay import Relay
 from agentmailbus.store import MAX_ATTEMPTS, BrokerStore, SeenStore
+from agentmailbus.wsutil import ws_connect
 
 
 # --- MCP transport -----------------------------------------------------------
 
 
-def _mcp_session(lines: list[dict], rpc) -> list[dict]:
+def _mcp_session(lines: list, rpc) -> list:
     stdin = io.BytesIO(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
     stdout = io.BytesIO()
     serve_stdio("grok-aima", rpc, stdin=stdin, stdout=stdout)
@@ -45,14 +46,25 @@ def test_mcp_stdio_is_newline_delimited_json() -> None:
     assert [r["id"] for r in replies] == [0, 1]
     assert replies[0]["result"]["protocolVersion"] == "2025-06-18"
     assert replies[1]["result"]["tools"][0]["name"] == "send"
+    # The old Content-Length framing is not a message: a header line is bad JSON, nothing more.
+    stdin = io.BytesIO(b'Content-Length: 2\r\n\r\n{}\n{"jsonrpc":"2.0","id":9,"method":"ping"}\n')
+    stdout = io.BytesIO()
+    serve_stdio("grok-aima", lambda p: {}, stdin=stdin, stdout=stdout)
+    replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert replies[0]["error"]["code"] == -32700
+    assert replies[-1] == {"jsonrpc": "2.0", "id": 9, "result": {}}
 
 
-def test_mcp_negotiates_a_supported_version() -> None:
+def test_mcp_negotiates_a_supported_version_and_batches() -> None:
     replies = _mcp_session(
-        [{"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}}],
+        [
+            {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}},
+            [{"jsonrpc": "2.0", "id": 1, "method": "ping"}, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}],
+        ],
         lambda payload: {},
     )
     assert replies[0]["result"]["protocolVersion"] == "2025-06-18"
+    assert [r["id"] for r in replies[1]] == [1, 2]
 
 
 def test_mcp_survives_a_relay_outage_and_bad_input() -> None:
@@ -62,6 +74,10 @@ def test_mcp_survives_a_relay_outage_and_bad_input() -> None:
     stdin = io.BytesIO(
         b'{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send","arguments":{"to":"rea-63","text":"hi"}}}\n'
         b"this is not json\n"
+        b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":[1,2]}\n'
+        b'{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"send","arguments":"x"}}\n'
+        b"\xff\xfe{}\n"
+        + b'{"jsonrpc":"2.0","id":10,"method":"ping","params":"' + b"x" * (300 * 1024) + b'"}\n'
         b'{"jsonrpc":"2.0","id":6,"method":"ping"}\n'
     )
     stdout = io.BytesIO()
@@ -69,9 +85,33 @@ def test_mcp_survives_a_relay_outage_and_bad_input() -> None:
     replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert replies[0]["id"] == 5
     assert replies[0]["result"]["isError"] is True
-    assert replies[0]["result"]["content"][0]["text"] == "relay-down"
+    assert replies[0]["result"]["content"][0]["text"].startswith("relay-down (retry with id ")
     assert replies[1]["error"]["code"] == -32700
-    assert replies[2] == {"jsonrpc": "2.0", "id": 6, "result": {}}
+    assert replies[2]["id"] == 7 and replies[2]["result"]["isError"] is True
+    assert replies[3]["id"] == 8 and replies[3]["result"]["content"][0]["text"] == "bad-arguments"
+    assert replies[4]["error"]["code"] == -32700
+    assert replies[5]["error"]["code"] == -32600
+    assert replies[6] == {"jsonrpc": "2.0", "id": 6, "result": {}}
+
+
+def test_mcp_retry_reuses_the_id() -> None:
+    seen = []
+
+    def rpc(payload):
+        seen.append(payload["id"])
+        return {"ok": True, "id": payload["id"], "waiting": False}
+
+    mid = str(uuid.uuid4())
+    replies = _mcp_session(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": "nope"}}},
+        ],
+        rpc,
+    )
+    assert seen == [mid, mid]
+    assert replies[2]["result"]["content"][0]["text"] == "bad-id"
 
 
 # --- Store -------------------------------------------------------------------
@@ -116,6 +156,7 @@ def test_nack_backs_off_then_gives_up(tmp_path: Path) -> None:
     row = store.get_message(mid)
     assert row["attempts"] == 1 and row["not_before"] > row["created_at"]
     assert store.queued("beta") == []  # not yet due
+    assert store.pushable(row) is False  # and a retried send may not jump the delay
     for _ in range(MAX_ATTEMPTS - 2):
         store.conn.execute("UPDATE messages SET state='delivered' WHERE id=?", (mid,))
         store.conn.commit()
@@ -123,20 +164,42 @@ def test_nack_backs_off_then_gives_up(tmp_path: Path) -> None:
     store.conn.execute("UPDATE messages SET state='delivered' WHERE id=?", (mid,))
     store.conn.commit()
     assert store.nack(mid) == "failed"
-    assert store.directory()[1]["queued"] == 0
+    beta = store.directory()[1]
+    assert beta["queued"] == 0 and beta["failed"] == 1
 
 
-def test_prune_drops_only_old_finished_rows(tmp_path: Path) -> None:
+def test_push_never_overtakes_an_older_queued_row(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    store.insert_message(first, "alpha", "beta", "m1", "next")
+    store.insert_message(second, "alpha", "beta", "m2", "next")
+    assert store.pushable(store.get_message(first)) is True
+    assert store.pushable(store.get_message(second)) is False
+    assert store.claim(first)
+    assert store.pushable(store.get_message(second)) is True
+
+
+def test_prune_uses_finish_time_and_dates_legacy_rows(tmp_path: Path) -> None:
     store = _store(tmp_path)
     old, new, live = (str(uuid.uuid4()) for _ in range(3))
     for mid in (old, new, live):
         store.insert_message(mid, "alpha", "beta", "x", "next")
-    store.conn.execute("UPDATE messages SET state='acked' WHERE id IN (?, ?)", (old, new))
-    store.conn.execute("UPDATE messages SET created_at='2000-01-01T00:00:00.000000+00:00' WHERE id=?", (old,))
+    for mid in (old, new):
+        store.claim(mid)
+        store.ack(mid)
+    store.conn.execute("UPDATE messages SET finished_at='2000-01-01T00:00:00.000000+00:00' WHERE id=?", (old,))
+    # A row created long ago but acked today stays for the full window.
+    store.conn.execute("UPDATE messages SET created_at='2000-01-01T00:00:00.000000+00:00' WHERE id=?", (new,))
     store.conn.commit()
     assert store.prune(7) == 1
     assert store.get_message(old) is None
     assert store.get_message(new) is not None and store.get_message(live) is not None
+    # Rows from before the broker stamped time are dated at migration, not pruned at once.
+    store.conn.execute("UPDATE messages SET created_at='', finished_at='' WHERE id=?", (new,))
+    store.conn.commit()
+    reopened = BrokerStore(tmp_path / "broker.db")
+    assert reopened.prune(7) == 0
+    assert reopened.get_message(new)["finished_at"] != ""
     seen = SeenStore(tmp_path / "seen.db")
     seen.mark("a")
     seen.conn.execute("UPDATE seen SET at='2000-01-01T00:00:00.000000+00:00'")
@@ -158,6 +221,7 @@ def test_one_bad_session_file_does_not_hide_the_others(tmp_path: Path) -> None:
     good = {"name": "good", "harness": "grok", "pid": os.getpid(), "wake": str(tmp_path / "w"), "socket": ""}
     save_binding(tmp_path, good)
     (tmp_path / "bad.json").write_text(json.dumps({"name": "bad", "harness": "grok", "pid": "abc", "wake": "x"}))
+    (tmp_path / "huge.json").write_text(json.dumps({"name": "huge", "harness": "grok", "pid": 2**70, "wake": "x"}))
     (tmp_path / "worse.json").write_text("[1, 2]")
     assert set(load_live(tmp_path)) == {"good"}
 
@@ -165,6 +229,7 @@ def test_one_bad_session_file_does_not_hide_the_others(tmp_path: Path) -> None:
 def test_another_users_pid_is_not_ours() -> None:
     assert pid_alive(os.getpid())
     assert not pid_alive(0)
+    assert not pid_alive(2**70)
     if os.getuid() != 0:
         assert not pid_alive(1)
 
@@ -191,8 +256,16 @@ def test_existing_directories_keep_their_mode(tmp_path: Path) -> None:
         {"id": "m", "from": "a", "from_host": "h", "to": "b", "text": "t"},
     )
     assert (shared.stat().st_mode & 0o777) == 0o755
-    fresh = private_dir(tmp_path / "fresh" / "deeper")
+    fresh = private_dir(shared / "fresh" / "deeper")
     assert (fresh.stat().st_mode & 0o777) == 0o700
+    assert ((shared / "fresh").stat().st_mode & 0o777) == 0o700  # every created component
+    assert (shared.stat().st_mode & 0o777) == 0o755
+
+
+def test_wake_file_must_be_a_regular_file(tmp_path: Path) -> None:
+    fifo = tmp_path / "wake.fifo"
+    os.mkfifo(fifo)
+    assert deliver_wake({"wake": str(fifo)}, {"id": "m", "from": "a", "to": "b", "text": "t"}) is False
 
 
 def test_wrapper_tag_cannot_be_forged() -> None:
@@ -320,19 +393,53 @@ async def _mesh(tmp_path: Path) -> None:
         assert conflict == {"ok": False, "id": mid, "error": "id-conflict"}
         assert "again" not in rec_a.texts()
 
-        # Only the owning relay may ack, nack, or unregister a name.
-        row_id = str(uuid.uuid4())
+        # A nacked message keeps its place: a newer send waits behind it and arrives after it.
         rec_b.ok = False
-        res = await relay_a.local_send("alpha", "beta", "sticky", mid=row_id)
-        assert res["ok"]
-        await _until(lambda: "sticky" in rec_b.texts())
-        await _until(lambda: broker.store.get_message(row_id)["state"] == "queued")
-        assert broker.store.get_message(row_id)["attempts"] == 1
+        sticky = str(uuid.uuid4())
+        res = await relay_a.local_send("alpha", "beta", "sticky", mid=sticky)
+        assert res["ok"] and res["waiting"] is False
+        await _until(lambda: broker.store.get_message(sticky)["state"] == "queued")
+        assert broker.store.get_message(sticky)["attempts"] == 1
         rec_b.ok = True
+        later = await relay_a.local_send("alpha", "beta", "after-sticky")
+        assert later["ok"] and later["waiting"] is True, later
+        await _until(lambda: "after-sticky" in rec_b.texts(), seconds=8)
+        texts = rec_b.texts()
+        assert texts.index("after-sticky") > len(texts) - 1 - texts[::-1].index("sticky")
+        await _until(lambda: broker.store.get_message(sticky)["state"] == "acked")
+
+        # Only the owning relay may ack, nack, or unregister a name.
+        foreign = str(uuid.uuid4())
+        rec_b.ok = False
+        await relay_a.local_send("alpha", "beta", "foreign", mid=foreign)
+        await _until(lambda: broker.store.get_message(foreign)["attempts"] == 1)
+        await _until(lambda: broker.store.get_message(foreign)["state"] == "queued")
+        await relay_a.ws.send(dumps({"type": "ack", "id": foreign}))
         await relay_a.ws.send(dumps({"type": "unregister", "name": "beta"}))
         await asyncio.sleep(0.3)
+        assert broker.store.get_message(foreign)["state"] == "queued"
         assert broker.owner["beta"] == "host-b"
-        await _until(lambda: broker.store.get_message(row_id)["state"] == "acked", seconds=6)
+        # Put the row in flight by hand, then nack it from the wrong relay and the right one.
+        broker.store.conn.execute("UPDATE messages SET state='delivered' WHERE id=?", (foreign,))
+        broker.store.conn.commit()
+        await relay_a.ws.send(dumps({"type": "nack", "id": foreign}))
+        await asyncio.sleep(0.3)
+        assert broker.store.get_message(foreign)["state"] == "delivered"
+        assert broker.store.get_message(foreign)["attempts"] == 1
+        await relay_b.ws.send(dumps({"type": "nack", "id": foreign}))
+        await _until(lambda: broker.store.get_message(foreign)["attempts"] == 2)
+        rec_b.ok = True
+        await _until(lambda: broker.store.get_message(foreign)["state"] == "acked", seconds=8)
+
+        # A failed message is refused on retry and shows in the directory.
+        dead = str(uuid.uuid4())
+        broker.store.insert_message(dead, "alpha", "beta", "dead", "next")
+        broker.store.conn.execute("UPDATE messages SET state='failed' WHERE id=?", (dead,))
+        broker.store.conn.commit()
+        refused = await relay_a.local_send("alpha", "beta", "dead", mid=dead)
+        assert refused == {"ok": False, "id": dead, "error": "delivery-failed"}
+        who = await relay_a.local_who()
+        assert [a["failed"] for a in who["agents"] if a["name"] == "beta"] == [1]
 
         # Large non-ASCII text goes through the local socket.
         big = "漢" * 30_000
@@ -344,6 +451,15 @@ async def _mesh(tmp_path: Path) -> None:
         assert reply["ok"] is True, reply
         await _until(lambda: big in rec_b.texts())
 
+        # Two callers with one id: the second is told the id is in flight, not given the first's reply.
+        twin = str(uuid.uuid4())
+        one = asyncio.create_task(relay_a.local_send("alpha", "beta", "twin", mid=twin))
+        await asyncio.sleep(0)
+        two = asyncio.create_task(relay_a.local_send("alpha", "beta", "twin", mid=twin))
+        results = await asyncio.gather(one, two, return_exceptions=True)
+        assert any(isinstance(r, dict) and r["ok"] for r in results)
+        assert any(getattr(r, "code", "") == "in-flight" for r in results)
+
         # A rebound session with a new pid is delivered to the new binding.
         _bind(relay_b.registry, "beta", pid=os.getppid())
         await _until(lambda: relay_b.registered["beta"]["pid"] == os.getppid())
@@ -354,8 +470,10 @@ async def _mesh(tmp_path: Path) -> None:
         # No live session on the relay: the message is handed back, not dropped.
         (relay_b.registry / "beta.json").unlink()
         ghost = str(uuid.uuid4())
-        await relay_b._deliver({"type": "deliver", "id": ghost, "to": "beta", "from": "alpha", "text": "x"})
-        assert broker.store.get_message(ghost) is None  # unknown id is ignored by the broker
+        await relay_a.local_send("alpha", "beta", "ghost", mid=ghost)
+        await _until(lambda: broker.store.get_message(ghost)["attempts"] == 1)
+        assert "ghost" not in rec_b.texts()
+        await _until(lambda: "beta" not in relay_b.registered)
 
         await relay_b.close()
         await task_b
@@ -365,7 +483,41 @@ async def _mesh(tmp_path: Path) -> None:
         await broker.stop()
 
 
-def test_mesh_bad_frames_and_pending_cap(tmp_path: Path) -> None:
+def test_mesh_worker_survives_a_store_error(tmp_path: Path) -> None:
+    asyncio.run(_worker(tmp_path))
+
+
+async def _worker(tmp_path: Path) -> None:
+    broker = await _broker(tmp_path)
+    rec = Recording()
+    try:
+        relay, task = await _relay(tmp_path, "host-a", "alpha", broker.port, rec)
+        await _settled(relay, "alpha")
+        real_mark = relay.seen.mark
+        blown = []
+
+        def mark_once(mid):
+            if not blown:
+                blown.append(mid)
+                raise RuntimeError("disk full")
+            real_mark(mid)
+
+        relay.seen.mark = mark_once
+        boom = str(uuid.uuid4())
+        await relay.local_send("alpha", "alpha", "boom", mid=boom)
+        await _until(lambda: broker.store.get_message(boom)["attempts"] == 1)
+        # The worker is still alive: the next message, and the retry, both get through.
+        await relay.local_send("alpha", "alpha", "next")
+        await _until(lambda: "next" in rec.texts())
+        await _until(lambda: broker.store.get_message(boom)["state"] == "acked", seconds=6)
+        assert "host-a" in broker.conns
+        await relay.close()
+        await task
+    finally:
+        await broker.stop()
+
+
+def test_mesh_bad_frames_and_per_ip_pending_cap(tmp_path: Path) -> None:
     asyncio.run(_frames(tmp_path))
 
 
@@ -382,6 +534,21 @@ async def _frames(tmp_path: Path) -> None:
         res = await relay.local_send("alpha", "alpha", "self")
         assert res["ok"]
         await _until(lambda: "self" in rec.texts())
+
+        # Silent connections from one address are capped; the next one is refused with 1013.
+        idle = [await ws_connect(f"ws://127.0.0.1:{broker.port}") for _ in range(MAX_PENDING_PER_IP)]
+        await _until(lambda: broker.pending.get("127.0.0.1", 0) == MAX_PENDING_PER_IP)
+        extra = await ws_connect(f"ws://127.0.0.1:{broker.port}")
+        with pytest.raises(Exception) as info:
+            await asyncio.wait_for(extra.recv(), 5)
+        assert getattr(getattr(info.value, "rcvd", None), "code", None) == 1013
+        # The authenticated relay is unaffected.
+        res = await relay.local_send("alpha", "alpha", "still")
+        assert res["ok"]
+        for ws in idle:
+            await ws.close()
+        await _until(lambda: broker.pending.get("127.0.0.1", 0) == 0)
+
         await relay.close()
         await task
     finally:

@@ -21,6 +21,9 @@ def pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
         return False
+    except (OverflowError, ValueError, OSError):
+        # A pid the platform cannot represent is not a process of ours.
+        return False
     return True
 
 

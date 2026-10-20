@@ -27,6 +27,9 @@ from agentmailbus.wsutil import ws_connect
 
 log = logging.getLogger("agentmailbus.relay")
 
+INBOX_LIMIT = 256  # deliver frames waiting for the worker; beyond this the read loop waits
+SEEN_PRUNE_INTERVAL = 3600.0
+
 
 class LocalError(Exception):
     def __init__(self, code: str) -> None:
@@ -133,13 +136,19 @@ class Relay:
             raise RuntimeError(welcome.get("error", "no welcome"))
         log.info("connected to %s as %s", self.url, self.host_id)
         self.connected.set()
-        self.inbox = asyncio.Queue()
+        self.inbox = asyncio.Queue(maxsize=INBOX_LIMIT)
         reader = asyncio.create_task(self._read(ws))
         poller = asyncio.create_task(self._poll())
         worker = asyncio.create_task(self._deliver_loop(self.inbox))
         try:
             await self.sync()
-            await reader
+            # The session ends when the link drops or the delivery worker dies.
+            # A dead worker must not leave a connected relay that delivers nothing.
+            await asyncio.wait({reader, worker}, return_when=asyncio.FIRST_COMPLETED)
+            if worker.done():
+                worker.result()
+                raise RuntimeError("delivery worker stopped")
+            reader.result()
         finally:
             for task in (reader, poller, worker):
                 task.cancel()
@@ -147,11 +156,19 @@ class Relay:
             self.inbox = None
 
     async def _poll(self) -> None:
+        loop = asyncio.get_running_loop()
+        next_prune = loop.time() + SEEN_PRUNE_INTERVAL
         while not self.stop.is_set():
             try:
                 await self.sync()
             except Exception as exc:
                 log.warning("registry sync failed: %s", type(exc).__name__)
+            if loop.time() >= next_prune:
+                next_prune = loop.time() + SEEN_PRUNE_INTERVAL
+                try:
+                    await asyncio.to_thread(self.seen.prune)
+                except Exception as exc:
+                    log.warning("seen prune failed: %s", type(exc).__name__)
             try:
                 await asyncio.wait_for(self.stop.wait(), 1)
                 return
@@ -225,7 +242,7 @@ class Relay:
             kind = msg.get("type")
             if kind == "deliver":
                 if self.inbox is not None:
-                    self.inbox.put_nowait(msg)
+                    await self.inbox.put(msg)
                 continue
             key = None
             if kind in {"registered", "error"} and msg.get("name"):
@@ -251,6 +268,12 @@ class Relay:
             except asyncio.CancelledError:
                 await asyncio.gather(job, return_exceptions=True)
                 raise
+            except Exception as exc:
+                # One bad delivery (a relay.db error, say) hands its message back and
+                # the worker carries on. It never dies quietly.
+                mid = str(msg.get("id") or "")
+                log.warning("delivery of %s raised %s; handing it back", mid, type(exc).__name__)
+                await self._nack(mid)
 
     async def _deliver(self, msg: dict) -> None:
         mid = str(msg.get("id") or "")
@@ -322,6 +345,9 @@ class Relay:
             await self._register(live[sender])
         if sender not in self.registered:
             raise LocalError("not-registered")
+        if mid in self.waiters:
+            # The same id is already on the wire; a second caller would steal its reply.
+            raise LocalError("in-flight")
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self.waiters[mid] = fut

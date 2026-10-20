@@ -30,7 +30,7 @@ The relay registers each live session and delivers on the machine:
 | dsh | One JSON line on the inbox socket named in the binding. Confirm that frame on a live dsh before relying on it. |
 | grok, orca | One JSON line appended to the wake file. A Grok session watches that file. There is no receive tool. |
 
-None of these sockets answer, so "delivered" means the bytes were written. PROTOCOL.md spells out what an ack does and does not promise. A delivery that fails is retried with backoff and given up after 20 attempts; `agentmailbus who` shows what is still pending.
+None of these sockets answer, so "delivered" means the bytes were written. PROTOCOL.md spells out what an ack does and does not promise. A delivery that fails is retried with backoff and given up after 20 attempts; `agentmailbus who` shows what is still pending and how many messages were given up on. A fresh message never overtakes an older one for the same recipient, so one message that keeps failing holds the ones behind it until it succeeds or is given up on.
 
 The broker database is the queue, not an archive: finished rows are deleted after 7 days. With `omi = true` in the relay config, each delivered message is also filed with `omind note`. That is off by default, because it writes whatever any token holder sent into the vault.
 
@@ -49,14 +49,18 @@ tail -n 0 -F ~/.local/share/agentmailbus/inbox/grok-aima.jsonl
 ## Run
 
 ```bash
+install -d -m 700 ~/.local/share/agentmailbus
 python3 -m venv ~/.local/share/agentmailbus/venv
 ~/.local/share/agentmailbus/venv/bin/pip install -e .
 ```
 
-Create the token on each host. Do not commit it.
+The data directory is made first so it is private; a directory that already exists keeps whatever mode it has.
+
+Create the token once, then put the same value on every host. Do not commit it.
 
 ```bash
-pass generate agentmailbus/token 32
+pass generate agentmailbus/token 32          # on the first host
+pass show agentmailbus/token | pass insert -e agentmailbus/token   # on each other host, pasted
 ```
 
 Broker, on pluto:
@@ -104,7 +108,7 @@ A dsh session:
 agentmailbus mcp --from dsh-main --harness dsh --socket /path/to/inbox.sock
 ```
 
-`agentmailbus who` lists names. `agentmailbus send --from grok-aima --to rea-63 --text "hello"` is the same call the tool makes; add `--id <uuid>` to retry a send as the same message.
+`agentmailbus who` lists names. `agentmailbus send --from grok-aima --to rea-63 --text "hello"` is the same call the tool makes; add `--id <uuid>` to retry a send as the same message. The MCP tool does the same: a failed call names the id it used, and a retry with that id is not a second message.
 
 A name the broker has never seen is `unknown-agent`. The recipient has to have registered at least once before mail can wait for it.
 

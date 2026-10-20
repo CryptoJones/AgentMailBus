@@ -123,7 +123,11 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         ensure_ascii=False,
     )
     data = memoryview((line + "\n").encode())
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    if path.exists() and not path.is_file():
+        # A FIFO or device would block or misbehave; the wake file is a regular file.
+        return False
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags, 0o600)
     try:
         while data:
             written = os.write(fd, data)

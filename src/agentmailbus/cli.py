@@ -193,7 +193,10 @@ def _who(args) -> None:
         raise SystemExit(str(result.get("error") or "who-failed"))
     for agent in result.get("agents") or []:
         flag = "online" if agent.get("online") else "offline"
-        print(f"{agent['name']}\t{agent['host']}\t{agent['harness']}\t{flag}\t{agent.get('queued', 0)}")
+        line = f"{agent['name']}\t{agent['host']}\t{agent['harness']}\t{flag}\t{agent.get('queued', 0)}"
+        if agent.get("failed"):
+            line += f"\tfailed={agent['failed']}"
+        print(line)
 
 
 def _toml(path: Path) -> dict:

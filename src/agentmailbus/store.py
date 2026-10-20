@@ -12,6 +12,9 @@ from agentmailbus.paths import private_dir
 MAX_ATTEMPTS = 20
 MAX_BACKOFF = 60.0
 RETENTION_DAYS = 7
+# The relay remembers ids longer than the broker keeps finished rows, so a row the
+# broker requeues after a long outage is still recognised. See PROTOCOL.md.
+SEEN_RETENTION_DAYS = 30
 
 
 def _now() -> str:
@@ -64,7 +67,8 @@ class BrokerStore:
                 created_at TEXT NOT NULL,
                 state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
-                not_before TEXT NOT NULL DEFAULT ''
+                not_before TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS messages_q ON messages(recipient, state);
             """
@@ -78,6 +82,16 @@ class BrokerStore:
             self.conn.execute("ALTER TABLE messages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
         if "not_before" not in cols:
             self.conn.execute("ALTER TABLE messages ADD COLUMN not_before TEXT NOT NULL DEFAULT ''")
+        if "finished_at" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''")
+        # Rows from before the broker stamped time: date them now so they age normally
+        # instead of being pruned on the first pass.
+        now = _now()
+        self.conn.execute("UPDATE messages SET created_at=? WHERE created_at=''", (now,))
+        self.conn.execute(
+            "UPDATE messages SET finished_at=? WHERE finished_at='' AND state IN ('acked', 'failed')",
+            (now,),
+        )
         self.conn.commit()
 
     def startup(self) -> None:
@@ -141,8 +155,22 @@ class BrokerStore:
         self.conn.commit()
 
     def get_message(self, mid: str) -> dict | None:
-        row = self.conn.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+        row = self.conn.execute("SELECT rowid, * FROM messages WHERE id=?", (mid,)).fetchone()
         return None if row is None else dict(row)
+
+    def pushable(self, row: dict) -> bool:
+        """A row may jump the pull cycle only when it is due and nothing older is still queued."""
+        if row["not_before"] > _now():
+            return False
+        older = self.conn.execute(
+            """
+            SELECT 1 FROM messages
+            WHERE recipient=? AND state='queued' AND rowid < ?
+            LIMIT 1
+            """,
+            (row["recipient"], row["rowid"]),
+        ).fetchone()
+        return older is None
 
     def claim(self, mid: str) -> bool:
         """Move one queued row to delivered. False when another path already took it."""
@@ -156,8 +184,8 @@ class BrokerStore:
     def ack(self, mid: str) -> None:
         if mid:
             self.conn.execute(
-                "UPDATE messages SET state='acked' WHERE id=? AND state='delivered'",
-                (mid,),
+                "UPDATE messages SET state='acked', finished_at=? WHERE id=? AND state='delivered'",
+                (_now(), mid),
             )
             self.conn.commit()
 
@@ -168,12 +196,15 @@ class BrokerStore:
             return ""
         attempts = int(row["attempts"]) + 1
         if attempts >= MAX_ATTEMPTS:
-            state, not_before = "failed", ""
+            state, not_before, finished = "failed", "", _now()
         else:
-            state, not_before = "queued", _later(backoff(attempts))
+            state, not_before, finished = "queued", _later(backoff(attempts)), ""
         self.conn.execute(
-            "UPDATE messages SET state=?, attempts=?, not_before=? WHERE id=? AND state='delivered'",
-            (state, attempts, not_before, mid),
+            """
+            UPDATE messages SET state=?, attempts=?, not_before=?, finished_at=?
+            WHERE id=? AND state='delivered'
+            """,
+            (state, attempts, not_before, finished, mid),
         )
         self.conn.commit()
         return state
@@ -181,7 +212,7 @@ class BrokerStore:
     def queued(self, name: str) -> list[dict]:
         rows = self.conn.execute(
             """
-            SELECT * FROM messages
+            SELECT rowid, * FROM messages
             WHERE recipient=? AND state='queued' AND not_before<=?
             ORDER BY rowid
             """,
@@ -216,9 +247,9 @@ class BrokerStore:
         self.conn.commit()
 
     def prune(self, days: float = RETENTION_DAYS) -> int:
-        """Drop finished rows older than `days`. That is also the id de-duplication window."""
+        """Drop rows that finished more than `days` ago. That is also the id de-duplication window."""
         cur = self.conn.execute(
-            "DELETE FROM messages WHERE state IN ('acked', 'failed') AND created_at < ?",
+            "DELETE FROM messages WHERE state IN ('acked', 'failed') AND finished_at < ?",
             (_before(days),),
         )
         self.conn.commit()
@@ -230,8 +261,13 @@ class BrokerStore:
         ).fetchall()
         out = []
         for row in rows:
-            pending = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM messages WHERE recipient=? AND state IN ('queued', 'delivered')",
+            counts = self.conn.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN state IN ('queued', 'delivered') THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END) AS failed
+                FROM messages WHERE recipient=?
+                """,
                 (row["name"],),
             ).fetchone()
             out.append(
@@ -240,7 +276,8 @@ class BrokerStore:
                     "host": row["host"],
                     "harness": row["harness"],
                     "online": bool(row["online"]),
-                    "queued": int(pending["n"]),
+                    "queued": int(counts["pending"] or 0),
+                    "failed": int(counts["failed"] or 0),
                 }
             )
         return out
@@ -265,7 +302,7 @@ class SeenStore:
         )
         self.conn.commit()
 
-    def prune(self, days: float = RETENTION_DAYS) -> int:
+    def prune(self, days: float = SEEN_RETENTION_DAYS) -> int:
         cur = self.conn.execute("DELETE FROM seen WHERE at < ?", (_before(days),))
         self.conn.commit()
         return cur.rowcount

@@ -23,7 +23,7 @@ from agentmailbus.wsutil import ws_serve
 
 log = logging.getLogger("agentmailbus.broker")
 
-MAX_PENDING = 64  # connections that may sit in the hello step at once
+MAX_PENDING_PER_IP = 8  # connections from one address that may sit in the hello step
 PRUNE_INTERVAL = 3600.0
 
 
@@ -46,7 +46,7 @@ class Broker:
         self.conns: dict[str, Any] = {}
         self.owner: dict[str, str] = {}
         self.server = None
-        self.pending = asyncio.Semaphore(MAX_PENDING)
+        self.pending: dict[str, int] = {}
         self.pruner: asyncio.Task | None = None
 
     async def start(self) -> None:
@@ -83,26 +83,32 @@ class Broker:
         if not ip_allowed(peer, self.allow):
             await ws.close(code=1008, reason="lan-only")
             return
-        if self.pending.locked():
+        if self.pending.get(peer, 0) >= MAX_PENDING_PER_IP:
             await ws.close(code=1013, reason="busy")
             return
-        async with self.pending:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), 5)
-                hello = loads(raw)
-            except Exception:
-                await ws.close(code=1008, reason="hello-timeout")
-                return
-            if hello.get("type") != "hello" or hello.get("v") != 1 or not tokens_equal(
-                hello.get("token"), self.token
-            ):
-                await self._refuse(ws, "unauthorized")
-                return
-            try:
-                relay_id = check_name(hello.get("host"), "host")
-            except ProtocolError as exc:
-                await self._refuse(ws, exc.code)
-                return
+        self.pending[peer] = self.pending.get(peer, 0) + 1
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 5)
+            hello = loads(raw)
+        except Exception:
+            hello = None
+        finally:
+            self.pending[peer] -= 1
+            if self.pending[peer] <= 0:
+                self.pending.pop(peer, None)
+        if hello is None:
+            await ws.close(code=1008, reason="hello-timeout")
+            return
+        if hello.get("type") != "hello" or hello.get("v") != 1 or not tokens_equal(
+            hello.get("token"), self.token
+        ):
+            await self._refuse(ws, "unauthorized")
+            return
+        try:
+            relay_id = check_name(hello.get("host"), "host")
+        except ProtocolError as exc:
+            await self._refuse(ws, exc.code)
+            return
         old = self.conns.get(relay_id)
         self.conns[relay_id] = ws
         if old is not None and old is not ws:
@@ -207,7 +213,7 @@ class Broker:
         self.store.set_online(name, False)
 
     async def _flush(self, ws, name: str) -> None:
-        """Claim each queued row before it goes out, so no row is sent twice."""
+        """Claim each due row before it goes out, so no row is sent twice."""
         for row in self.store.queued(name):
             if not self.store.claim(row["id"]):
                 continue
@@ -218,9 +224,14 @@ class Broker:
                 raise
 
     async def _push(self, row: dict) -> bool:
-        """Try to hand a queued row to its recipient now. True when it is in flight."""
+        """Hand a queued row to its recipient now, if that keeps the order. True when in flight.
+
+        A row goes out ahead of the pull cycle only when it is due and no older row for
+        the same recipient is still queued; otherwise it waits for the flush, which sends
+        in acceptance order.
+        """
         dest = self.conns.get(self.owner.get(row["recipient"], ""))
-        if dest is None:
+        if dest is None or not self.store.pushable(row):
             return False
         if not self.store.claim(row["id"]):
             return True
@@ -259,13 +270,15 @@ class Broker:
             await ws.send(dumps({"type": "error", "id": mid, "error": "id-conflict"}))
             return
         assert existing is not None
+        if existing["state"] == "failed":
+            await ws.send(dumps({"type": "error", "id": mid, "error": "delivery-failed"}))
+            return
         waiting = existing["state"] == "queued"
         if waiting:
             waiting = not await self._push(existing)
         await ws.send(
             dumps({"type": "accepted", "id": mid, "to": recipient, "waiting": waiting})
         )
-
 
 def _deliver_frame(row: dict) -> dict:
     return {
