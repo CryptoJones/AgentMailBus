@@ -1,12 +1,20 @@
-"""Stdio MCP server. The only tool is send. Receiving is the relay's job."""
+"""Stdio MCP server. The only tool is send. Receiving is the relay's job.
+
+MCP stdio framing is one JSON-RPC object per line, no headers.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 import sys
 
 from agentmailbus import __version__
 from agentmailbus.protocol import ProtocolError, check_name, check_priority, check_text
+
+log = logging.getLogger("agentmailbus.mcp")
+
+SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 SEND_TOOL = {
     "name": "send",
@@ -37,7 +45,8 @@ def handle_request(msg: dict, sender: str, rpc) -> dict | None:
         return None
     method = msg.get("method")
     if method == "initialize":
-        version = (msg.get("params") or {}).get("protocolVersion") or "2024-11-05"
+        asked = (msg.get("params") or {}).get("protocolVersion")
+        version = asked if asked in SUPPORTED_VERSIONS else SUPPORTED_VERSIONS[0]
         return {
             "jsonrpc": "2.0",
             "id": mid,
@@ -70,9 +79,14 @@ def _call(mid, params: dict, sender: str, rpc) -> dict:
         priority = check_priority(args.get("priority"))
     except ProtocolError as exc:
         return _tool_error(mid, exc.code)
-    result = rpc(
-        {"op": "send", "from": sender, "to": recipient, "text": text, "priority": priority}
-    )
+    try:
+        result = rpc(
+            {"op": "send", "from": sender, "to": recipient, "text": text, "priority": priority}
+        )
+    except (OSError, ProtocolError, ValueError) as exc:
+        # The relay is down or restarting. The tool fails; the server stays up.
+        log.warning("relay call failed: %s", type(exc).__name__)
+        return _tool_error(mid, "relay-down")
     if not result.get("ok"):
         return _tool_error(mid, str(result.get("error") or "send-failed"))
     state = "queued" if result.get("waiting") else "accepted"
@@ -94,27 +108,19 @@ def _tool_error(mid, code: str) -> dict:
 
 
 def read_message(stream) -> dict | None:
-    headers: dict[str, str] = {}
+    """One JSON object per line. None at end of input. Raises JSONDecodeError on a bad line."""
     while True:
         line = stream.readline()
-        if line in (b"", b"\n", b"\r\n"):
-            break
-        if b":" not in line:
+        if line == b"":
+            return None
+        line = line.strip()
+        if not line:
             continue
-        key, value = line.decode("ascii", "replace").split(":", 1)
-        headers[key.strip().lower()] = value.strip()
-    if not headers:
-        return None
-    length = int(headers.get("content-length") or "0")
-    if length <= 0:
-        return None
-    body = stream.read(length)
-    return json.loads(body)
+        return json.loads(line)
 
 
 def write_message(stream, obj: dict) -> None:
-    data = json.dumps(obj).encode()
-    stream.write(f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
+    stream.write((json.dumps(obj, ensure_ascii=False) + "\n").encode())
     stream.flush()
 
 
@@ -125,9 +131,15 @@ def serve_stdio(sender: str, rpc, stdin=None, stdout=None) -> None:
         try:
             msg = read_message(stdin)
         except json.JSONDecodeError:
-            break
+            write_message(
+                stdout,
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
+            )
+            continue
         if msg is None:
             break
+        if not isinstance(msg, dict):
+            continue
         reply = handle_request(msg, sender, rpc)
         if reply is not None:
             write_message(stdout, reply)

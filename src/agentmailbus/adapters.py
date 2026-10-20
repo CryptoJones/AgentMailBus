@@ -1,32 +1,48 @@
-"""Local delivery. Receiving never goes through an MCP tool."""
+"""Local delivery. Receiving never goes through an MCP tool.
+
+None of these sockets answer. cc-socks sends no reply, and the dsh inbox is this
+project's own contract. "Delivered" therefore means the bytes were written, not that
+the session accepted them. PROTOCOL.md says the same.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import socket
+import tempfile
 from pathlib import Path
+
+from agentmailbus.paths import private_dir
 
 # Claude Code listens on this socket. The frame matches the protocol verified
 # 2026-10-03: an auth line, then a user line. The peer token file is
 # ~/.claude/sessions/<pid>.<sha256 of the socket path>.key
 
+_TAG = re.compile(r"<(/?)cross-session-message", re.IGNORECASE)
+
 
 def claude_socket(pid: int) -> str:
+    """Where Claude Code puts its socket: $XDG_RUNTIME_DIR, then the temp dir.
+
+    Claude Code moves to `cc-socks-<uid>` when the temp-dir path would exceed the
+    Unix socket path limit. The same rule is applied to the same temp dir here.
+    """
     uid = os.getuid()
     name = f"{pid}.sock"
     candidates: list[str] = []
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
         candidates.append(os.path.join(xdg, "cc-socks", name))
-    tmp = os.path.join("/tmp", "cc-socks", name)
+    tmpdir = tempfile.gettempdir()
+    tmp = os.path.join(tmpdir, "cc-socks", name)
     if len(tmp.encode()) > 103:
-        tmp = os.path.join(f"/tmp/cc-socks-{uid}", name)
-    candidates.append(tmp)
-    short = os.path.join(f"/tmp/cc-socks-{uid}", name)
-    if short not in candidates:
-        candidates.append(short)
+        tmp = os.path.join(tmpdir, f"cc-socks-{uid}", name)
+    for candidate in (tmp, os.path.join("/tmp", "cc-socks", name), os.path.join("/tmp", f"cc-socks-{uid}", name)):
+        if candidate not in candidates:
+            candidates.append(candidate)
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
@@ -46,6 +62,11 @@ def peer_token(sock_path: str, pid: int) -> str | None:
     return None
 
 
+def escape_text(text: str) -> str:
+    """Stop a message from closing or opening the wrapper tag around it."""
+    return _TAG.sub(r"&lt;\1cross-session-message", text)
+
+
 def claude_frames(binding: dict, message: dict) -> list[bytes]:
     sock_path = binding.get("socket") or claude_socket(int(binding["pid"]))
     body = (
@@ -55,7 +76,7 @@ def claude_frames(binding: dict, message: dict) -> list[bytes]:
     ).format(
         host=message.get("from_host") or "agentmailbus",
         name=message["from"],
-        text=message["text"],
+        text=escape_text(message["text"]),
     )
     user = {
         "type": "user",
@@ -89,8 +110,7 @@ def deliver_claude(binding: dict, message: dict) -> bool:
 
 def deliver_wake(binding: dict, message: dict) -> bool:
     path = Path(binding["wake"]).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
+    private_dir(path.parent)
     line = json.dumps(
         {
             "id": message["id"],
@@ -102,9 +122,14 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         },
         ensure_ascii=False,
     )
+    data = memoryview((line + "\n").encode())
     fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        os.write(fd, (line + "\n").encode())
+        while data:
+            written = os.write(fd, data)
+            if written <= 0:
+                raise OSError("short write")
+            data = data[written:]
         os.fsync(fd)
     finally:
         os.close(fd)

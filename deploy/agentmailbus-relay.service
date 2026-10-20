@@ -1,6 +1,7 @@
+# User unit. Run `loginctl enable-linger $USER` once so it starts at boot.
+# Use token = "file:..." in the config; pass needs an unlocked gpg-agent.
 [Unit]
 Description=AgentMailBus relay
-After=network-online.target
 
 [Service]
 ExecStart=%h/.local/share/agentmailbus/venv/bin/agentmailbus relay --config %h/.config/agentmailbus/relay.toml

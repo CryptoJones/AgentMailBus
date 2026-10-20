@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Any
 
 MAX_TEXT = 32_000
@@ -28,7 +29,10 @@ def loads(raw: str | bytes) -> dict[str, Any]:
     if isinstance(raw, bytes):
         if len(raw) > MAX_FRAME:
             raise ProtocolError("too-large")
-        text = raw.decode("utf-8")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError("bad-json") from exc
     else:
         text = raw
         if len(text.encode("utf-8")) > MAX_FRAME:
@@ -45,6 +49,19 @@ def loads(raw: str | bytes) -> dict[str, Any]:
 def check_name(value: object, field: str = "name") -> str:
     if not isinstance(value, str) or NAME.fullmatch(value) is None:
         raise ProtocolError("bad-name", field)
+    return value
+
+
+def check_id(value: object) -> str:
+    """A message id is a UUID in its canonical text form."""
+    if not isinstance(value, str):
+        raise ProtocolError("bad-id")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise ProtocolError("bad-id") from exc
+    if str(parsed) != value:
+        raise ProtocolError("bad-id")
     return value
 
 

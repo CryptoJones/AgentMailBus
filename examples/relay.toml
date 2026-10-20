@@ -1,8 +1,11 @@
 # One relay per host. Point broker at pluto.
 broker = "ws://172.16.28.254:8770"
+# Under a systemd user unit, prefer file:~/.config/agentmailbus/token (mode 0600);
+# pass needs an unlocked gpg-agent.
 token = "pass:agentmailbus/token"
 host = ""
 socket = "~/.local/share/agentmailbus/relay.sock"
 registry = "~/.local/share/agentmailbus/sessions"
 state = "~/.local/share/agentmailbus/relay.db"
-omi = true
+# Mirror each delivered message into OMI with `omind note`. Off by default.
+omi = false

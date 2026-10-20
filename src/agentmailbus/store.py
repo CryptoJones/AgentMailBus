@@ -4,22 +4,41 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agentmailbus.paths import private_dir
+
+MAX_ATTEMPTS = 20
+MAX_BACKOFF = 60.0
+RETENTION_DAYS = 7
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _later(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="microseconds")
+
+
+def _before(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="microseconds")
+
+
+def backoff(attempts: int) -> float:
+    return min(float(2**attempts), MAX_BACKOFF)
 
 
 def _open(path: Path) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
+    private_dir(path.parent)
+    if not path.exists():
+        path.touch(mode=0o600)
+    os.chmod(path, 0o600)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=3000")
-    os.chmod(path, 0o600)
     return conn
 
 
@@ -43,12 +62,23 @@ class BrokerStore:
                 text TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                state TEXT NOT NULL
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                not_before TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS messages_q ON messages(recipient, state);
             """
         )
+        self._migrate()
         self.startup()
+
+    def _migrate(self) -> None:
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages)")}
+        if "attempts" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        if "not_before" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN not_before TEXT NOT NULL DEFAULT ''")
+        self.conn.commit()
 
     def startup(self) -> None:
         self.conn.execute("UPDATE messages SET state='queued' WHERE state='delivered'")
@@ -99,14 +129,14 @@ class BrokerStore:
         recipient: str,
         text: str,
         priority: str,
-        created_at: str,
     ) -> None:
+        """The broker stamps the time. Nothing the sender supplies decides the order."""
         self.conn.execute(
             """
             INSERT INTO messages(id, sender, recipient, from_host, text, priority, created_at, state)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')
             """,
-            (mid, sender, recipient, self.host_of(sender), text, priority, created_at),
+            (mid, sender, recipient, self.host_of(sender), text, priority, _now()),
         )
         self.conn.commit()
 
@@ -114,22 +144,48 @@ class BrokerStore:
         row = self.conn.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
         return None if row is None else dict(row)
 
-    def mark(self, mid: str, state: str) -> None:
-        self.conn.execute("UPDATE messages SET state=? WHERE id=?", (state, mid))
+    def claim(self, mid: str) -> bool:
+        """Move one queued row to delivered. False when another path already took it."""
+        cur = self.conn.execute(
+            "UPDATE messages SET state='delivered' WHERE id=? AND state='queued'",
+            (mid,),
+        )
         self.conn.commit()
+        return cur.rowcount == 1
 
     def ack(self, mid: str) -> None:
         if mid:
-            self.mark(mid, "acked")
+            self.conn.execute(
+                "UPDATE messages SET state='acked' WHERE id=? AND state='delivered'",
+                (mid,),
+            )
+            self.conn.commit()
+
+    def nack(self, mid: str) -> str:
+        """Count the attempt and requeue with a delay, or give up. Returns the new state."""
+        row = self.get_message(mid) if mid else None
+        if row is None or row["state"] != "delivered":
+            return ""
+        attempts = int(row["attempts"]) + 1
+        if attempts >= MAX_ATTEMPTS:
+            state, not_before = "failed", ""
+        else:
+            state, not_before = "queued", _later(backoff(attempts))
+        self.conn.execute(
+            "UPDATE messages SET state=?, attempts=?, not_before=? WHERE id=? AND state='delivered'",
+            (state, attempts, not_before, mid),
+        )
+        self.conn.commit()
+        return state
 
     def queued(self, name: str) -> list[dict]:
         rows = self.conn.execute(
             """
             SELECT * FROM messages
-            WHERE recipient=? AND state='queued'
-            ORDER BY created_at, id
+            WHERE recipient=? AND state='queued' AND not_before<=?
+            ORDER BY rowid
             """,
-            (name,),
+            (name, _now()),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -159,14 +215,23 @@ class BrokerStore:
         )
         self.conn.commit()
 
+    def prune(self, days: float = RETENTION_DAYS) -> int:
+        """Drop finished rows older than `days`. That is also the id de-duplication window."""
+        cur = self.conn.execute(
+            "DELETE FROM messages WHERE state IN ('acked', 'failed') AND created_at < ?",
+            (_before(days),),
+        )
+        self.conn.commit()
+        return cur.rowcount
+
     def directory(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT name, host, harness, online FROM agents ORDER BY name"
         ).fetchall()
         out = []
         for row in rows:
-            queued = self.conn.execute(
-                "SELECT COUNT(*) AS n FROM messages WHERE recipient=? AND state!='acked'",
+            pending = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE recipient=? AND state IN ('queued', 'delivered')",
                 (row["name"],),
             ).fetchone()
             out.append(
@@ -175,7 +240,7 @@ class BrokerStore:
                     "host": row["host"],
                     "harness": row["harness"],
                     "online": bool(row["online"]),
-                    "queued": int(queued["n"]),
+                    "queued": int(pending["n"]),
                 }
             )
         return out
@@ -199,3 +264,8 @@ class SeenStore:
             (mid, _now()),
         )
         self.conn.commit()
+
+    def prune(self, days: float = RETENTION_DAYS) -> int:
+        cur = self.conn.execute("DELETE FROM seen WHERE at < ?", (_before(days),))
+        self.conn.commit()
+        return cur.rowcount
