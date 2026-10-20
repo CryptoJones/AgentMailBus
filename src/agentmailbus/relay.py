@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agentmailbus.adapters import default_adapters
@@ -29,6 +30,8 @@ from agentmailbus.wsutil import ws_connect
 log = logging.getLogger("agentmailbus.relay")
 
 SEEN_PRUNE_INTERVAL = 3600.0
+WORKER_IDLE = 60.0  # a name's delivery worker exits after this long with nothing to do
+DELIVERY_THREADS = 128  # adapters and OMI notes run here, not on the default pool
 
 
 class BrokerRefused(RuntimeError):
@@ -74,6 +77,7 @@ class Relay:
         # One delivery queue and worker per name, so a slow delivery for one name
         # never holds another name's message past the broker's deadline.
         self.workers: dict[str, tuple[asyncio.Queue, asyncio.Task]] = {}
+        self.pool = ThreadPoolExecutor(max_workers=DELIVERY_THREADS, thread_name_prefix="deliver")
         self.next_prune = 0.0
         # Ids that were written but could not be recorded in the seen store. Kept in
         # memory so a reconnect inside this process does not inject them again.
@@ -112,6 +116,10 @@ class Relay:
             if self.unix is not None:
                 self.unix.close()
                 await self.unix.wait_closed()
+            self.pool.shutdown(wait=False)
+
+    async def _in_thread(self, fn, *args):
+        return await asyncio.get_running_loop().run_in_executor(self.pool, fn, *args)
 
     async def close(self) -> None:
         self.stop.set()
@@ -153,7 +161,7 @@ class Relay:
             await self.sync()
             await reader
         finally:
-            tasks = [reader, poller, *(task for _, task in self.workers.values())]
+            tasks = [reader, poller, *(task for _, task in list(self.workers.values()))]
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -169,7 +177,7 @@ class Relay:
         entry = self.workers.get(name)
         if entry is None or entry[1].done():
             queue: asyncio.Queue = asyncio.Queue()
-            entry = (queue, asyncio.create_task(self._deliver_loop(queue)))
+            entry = (queue, asyncio.create_task(self._deliver_loop(name, queue)))
             self.workers[name] = entry
         entry[0].put_nowait(msg)
 
@@ -283,14 +291,23 @@ class Relay:
                 if not fut.done():
                     fut.set_result(msg)
 
-    async def _deliver_loop(self, inbox: asyncio.Queue) -> None:
+    async def _deliver_loop(self, name: str, inbox: asyncio.Queue) -> None:
         """Deliver one name's messages, one at a time, off the read loop.
 
         A delivery in progress is allowed to finish when the session ends, so the
-        seen-mark that stops a second injection is never skipped.
+        seen-mark that stops a second injection is never skipped. A worker with
+        nothing to do for WORKER_IDLE seconds removes itself; `_enqueue` starts a
+        fresh one when the next frame arrives.
         """
         while True:
-            msg = await inbox.get()
+            try:
+                msg = await asyncio.wait_for(inbox.get(), WORKER_IDLE)
+            except asyncio.TimeoutError:
+                if inbox.empty():
+                    if self.workers.get(name, (None, None))[0] is inbox:
+                        del self.workers[name]
+                    return
+                continue
             job = asyncio.ensure_future(self._deliver(msg))
             try:
                 await asyncio.shield(job)
@@ -303,6 +320,8 @@ class Relay:
                 mid = str(msg.get("id") or "")
                 log.warning("delivery of %s raised %s; handing it back", mid, type(exc).__name__)
                 await self._nack(mid)
+            finally:
+                msg = job = None  # keep no payload alive while idle
 
     async def _deliver(self, msg: dict) -> None:
         mid = str(msg.get("id") or "")
@@ -324,7 +343,7 @@ class Relay:
             await self._nack(mid)
             return
         try:
-            ok = await asyncio.to_thread(fn, binding, msg)
+            ok = await self._in_thread(fn, binding, msg)
         except Exception as exc:
             log.warning("delivery failed for %s: %s", mid, type(exc).__name__)
             ok = False
@@ -335,23 +354,27 @@ class Relay:
         # or the broker would hand the same message back for a second injection.
         try:
             self.seen.mark(mid)
-            self._drain_fallback()
         except Exception as exc:
             log.warning("could not record %s as seen: %s", mid, type(exc).__name__)
             self.seen_fallback.add(mid)
+        else:
+            self._drain_fallback()
         await self._ack(mid)
         # The note is bookkeeping; the next message for this name waits on the ack,
         # so it goes out before the note is written.
         if self.omi.enabled:
             try:
-                await asyncio.to_thread(self.omi.write, msg)
+                await self._in_thread(self.omi.write, msg)
             except Exception as exc:
                 log.warning("omi mirror raised for %s: %s", mid, type(exc).__name__)
 
     def _drain_fallback(self) -> None:
         """The seen store works again: move the ids held in memory into it."""
         for held in list(self.seen_fallback):
-            self.seen.mark(held)
+            try:
+                self.seen.mark(held)
+            except Exception:
+                return
             self.seen_fallback.discard(held)
 
     async def _ack(self, mid: str) -> None:

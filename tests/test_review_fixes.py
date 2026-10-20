@@ -11,6 +11,10 @@ from pathlib import Path
 
 import pytest
 
+import threading
+
+import agentmailbus.adapters as adapters
+import agentmailbus.relay as relay_module
 from agentmailbus.adapters import deliver_wake, escape_text
 from agentmailbus.broker import MAX_PENDING_PER_IP, Broker
 from agentmailbus.cli import _run_relay
@@ -191,6 +195,13 @@ def test_a_lost_ack_does_not_block_a_name_forever(tmp_path: Path) -> None:
     assert store.stale(store.head("beta"))
     assert store.nack(first) == "queued"
     assert store.get_message(first)["attempts"] == 1
+    # A late ack finishes a row the broker gave up on; an ack for a row never handed out is ignored.
+    store.conn.execute("UPDATE messages SET state='failed', attempts=20 WHERE id=?", (first,))
+    store.conn.commit()
+    store.ack(first)
+    assert store.get_message(first)["state"] == "acked"
+    store.ack(second)
+    assert store.get_message(second)["state"] == "queued"
     # A rollback carries the stamp of the claim that made it, so it cannot undo a newer claim.
     store.conn.execute("UPDATE messages SET state='delivered', delivered_at='later' WHERE id=?", (first,))
     store.conn.commit()
@@ -774,6 +785,94 @@ async def _lost_ack(tmp_path: Path) -> None:
         assert "slow-one" not in rec.texts()
         await _until(lambda: "slow-one" in rec.texts(), seconds=3)
 
+        await relay.close()
+        await task
+    finally:
+        await broker.stop()
+
+
+def test_wake_partial_write_is_taken_back_or_fenced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    wake = tmp_path / "w.jsonl"
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    assert deliver_wake({"wake": str(wake)}, msg)
+    clean = wake.read_bytes()
+    real_write = os.write
+
+    calls = []
+
+    def half_then_fail(fd, data):
+        # A real short write returns a count; the next write is what fails.
+        if not calls:
+            calls.append(1)
+            return real_write(fd, bytes(data)[: max(1, len(data) // 2)])
+        raise OSError(28, "no space")
+
+    # Nothing else wrote: the fragment is removed and the delivery is a nack.
+    monkeypatch.setattr(adapters.os, "write", half_then_fail)
+    assert deliver_wake({"wake": str(wake)}, msg) is False
+    assert wake.read_bytes() == clean
+
+    # Another line landed after the fragment: it is kept, the fragment is fenced off.
+    calls.clear()
+
+    def half_then_neighbour_then_fail(fd, data):
+        if not calls:
+            calls.append(1)
+            return real_write(fd, bytes(data)[: max(1, len(data) // 2)])
+        if len(data) == 1:
+            return real_write(fd, data)  # the fence newline itself still works
+        with open(wake, "ab") as other:
+            other.write(b'{"id":"n","text":"neighbour"}\n')
+        raise OSError(28, "no space")
+
+    monkeypatch.setattr(adapters.os, "write", half_then_neighbour_then_fail)
+    assert deliver_wake({"wake": str(wake)}, msg) is False
+    monkeypatch.setattr(adapters.os, "write", real_write)
+    raw = wake.read_bytes()
+    assert b'{"id":"n","text":"neighbour"}' in raw  # the other writer's bytes were not truncated away
+    assert raw.startswith(clean)
+    assert raw.endswith(b"\n")  # fenced, so the retry starts a clean line
+    assert deliver_wake({"wake": str(wake)}, msg)
+    last = wake.read_bytes().split(b"\n")[-2]
+    assert json.loads(last)["id"] == "m"
+
+
+def test_wake_writers_sharing_a_file_never_interleave(tmp_path: Path) -> None:
+    wake = tmp_path / "shared.jsonl"
+    text = "x" * 20_000
+
+    def writer(name: str) -> None:
+        for i in range(30):
+            assert deliver_wake({"wake": str(wake)}, {"id": f"{name}-{i}", "from": name, "to": "z", "text": text})
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in ("grok", "orca", "third")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    lines = wake.read_text().splitlines()
+    assert len(lines) == 90
+    assert all(json.loads(line)["text"] == text for line in lines)
+
+
+def test_idle_delivery_worker_goes_away(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(relay_module, "WORKER_IDLE", 0.2)
+    asyncio.run(_idle(tmp_path))
+
+
+async def _idle(tmp_path: Path) -> None:
+    broker = await _broker(tmp_path)
+    rec = Recording()
+    try:
+        relay, task = await _relay(tmp_path, "host-a", "alpha", broker.port, rec)
+        await _settled(relay, "alpha")
+        await relay.local_send("alpha", "alpha", "one")
+        await _until(lambda: "one" in rec.texts())
+        assert "alpha" in relay.workers
+        await _until(lambda: "alpha" not in relay.workers, seconds=2)
+        await relay.local_send("alpha", "alpha", "two")
+        await _until(lambda: "two" in rec.texts())
+        assert "alpha" in relay.workers
         await relay.close()
         await task
     finally:

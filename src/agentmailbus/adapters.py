@@ -15,6 +15,7 @@ import re
 import socket
 import stat
 import tempfile
+import threading
 from pathlib import Path
 
 from agentmailbus.paths import private_dir
@@ -112,6 +113,20 @@ def deliver_claude(binding: dict, message: dict) -> bool:
     return True
 
 
+_wake_locks: dict[str, threading.Lock] = {}
+_wake_locks_guard = threading.Lock()
+
+
+def _wake_lock(path: Path) -> threading.Lock:
+    """One lock per wake path. Two names may share a file; their writes never overlap."""
+    key = os.path.realpath(path)
+    with _wake_locks_guard:
+        lock = _wake_locks.get(key)
+        if lock is None:
+            lock = _wake_locks[key] = threading.Lock()
+        return lock
+
+
 def deliver_wake(binding: dict, message: dict) -> bool:
     path = Path(binding["wake"]).expanduser()
     private_dir(path.parent)
@@ -126,7 +141,12 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         },
         ensure_ascii=False,
     )
-    data = memoryview((line + "\n").encode())
+    with _wake_lock(path):
+        return _append_line(path, (line + "\n").encode())
+
+
+def _append_line(path: Path, payload: bytes) -> bool:
+    data = memoryview(payload)
     fd = _open_wake(path)
     if fd is None:
         return False
@@ -134,20 +154,21 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return False
         start = os.fstat(fd).st_size
+        done = 0
         try:
             while data:
                 written = os.write(fd, data)
                 if written <= 0:
                     raise OSError("short write")
                 data = data[written:]
+                done += written
         except OSError:
-            # A torn line must not stay in the file ahead of the retry.
-            try:
-                os.ftruncate(fd, start)
-            except OSError:
-                log.warning("partial wake line left in %s", path)
-                return True
-            raise
+            # Part of a line is in the file. Take it back out, but only if nothing
+            # else landed after it; otherwise end the fragment with a newline so a
+            # line reader skips it. Either way this delivery is not complete.
+            if done:
+                _unwrite(fd, path, start, done)
+            return False
         try:
             os.fsync(fd)
         except OSError as exc:
@@ -162,6 +183,20 @@ def deliver_wake(binding: dict, message: dict) -> bool:
     return True
 
 
+def _unwrite(fd: int, path: Path, start: int, done: int) -> None:
+    try:
+        if os.fstat(fd).st_size == start + done:
+            os.ftruncate(fd, start)
+            return
+    except OSError:
+        pass
+    try:
+        os.write(fd, b"\n")
+    except OSError:
+        pass
+    log.warning("partial wake line left in %s", path)
+
+
 def _open_wake(path: Path) -> int | None:
     """Open the wake file for append. A file created here is made 0600 through its
     descriptor, whatever the umask. O_NONBLOCK keeps a FIFO without a reader from
@@ -170,10 +205,7 @@ def _open_wake(path: Path) -> int | None:
     try:
         fd = os.open(path, base | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        try:
-            return os.open(path, base)
-        except OSError:
-            return None
+        return _open_existing(path, base)
     except OSError:
         return None
     try:
@@ -182,6 +214,24 @@ def _open_wake(path: Path) -> int | None:
         os.close(fd)
         return None
     return fd
+
+
+def _open_existing(path: Path, flags: int) -> int | None:
+    try:
+        return os.open(path, flags)
+    except PermissionError:
+        # A relay killed between creating the file and setting its mode leaves a
+        # mode-000 file of our own. Repair that one case by name and try once more.
+        try:
+            st = os.lstat(path)
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and (st.st_mode & 0o777) == 0:
+                os.chmod(path, 0o600)
+                return os.open(path, flags)
+        except OSError:
+            pass
+        return None
+    except OSError:
+        return None
 
 
 def deliver_dsh(binding: dict, message: dict) -> bool:
