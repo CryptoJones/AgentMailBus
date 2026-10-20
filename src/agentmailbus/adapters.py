@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
@@ -21,6 +22,8 @@ from agentmailbus.paths import private_dir
 # Claude Code listens on this socket. The frame matches the protocol verified
 # 2026-10-03: an auth line, then a user line. The peer token file is
 # ~/.claude/sessions/<pid>.<sha256 of the socket path>.key
+
+log = logging.getLogger("agentmailbus.adapters")
 
 _TAG = re.compile(r"<(/?)cross-session-message", re.IGNORECASE)
 
@@ -124,10 +127,17 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         ensure_ascii=False,
     )
     data = memoryview((line + "\n").encode())
-    existed = path.exists()
-    # O_NONBLOCK keeps a FIFO without a reader from hanging the open; the fstat
-    # check below is what guarantees the bytes land in a regular file.
-    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NONBLOCK", 0)
+    # O_NONBLOCK keeps a FIFO without a reader from hanging the open, O_NOFOLLOW
+    # refuses a symlink in the file's place, and the fstat check is what guarantees
+    # the bytes land in a regular file. A file this call creates is 0600 from the
+    # open itself (umask can only remove bits), so nothing is chmodded by name.
+    flags = (
+        os.O_APPEND
+        | os.O_CREAT
+        | os.O_WRONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
         fd = os.open(path, flags, 0o600)
     except OSError:
@@ -140,11 +150,14 @@ def deliver_wake(binding: dict, message: dict) -> bool:
             if written <= 0:
                 raise OSError("short write")
             data = data[written:]
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            # The line is written and a reader may already have it. A retry would
+            # append it twice, so this is a delivered message with a logged sync error.
+            log.warning("fsync failed for %s: %s", path, type(exc).__name__)
     finally:
         os.close(fd)
-    if not existed:
-        os.chmod(path, 0o600)
     return True
 
 

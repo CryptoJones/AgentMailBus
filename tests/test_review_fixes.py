@@ -89,6 +89,7 @@ def test_mcp_survives_a_relay_outage_and_bad_input() -> None:
     assert replies[0]["id"] == 5
     assert replies[0]["result"]["isError"] is True
     assert replies[0]["result"]["content"][0]["text"].startswith("relay-down (message id ")
+    assert replies[0]["result"]["content"][0]["text"].endswith("retry with this id)")
     assert replies[1]["error"]["code"] == -32700
     assert replies[2]["id"] == 7 and replies[2]["result"]["isError"] is True
     assert replies[3]["id"] == 8 and replies[3]["result"]["content"][0]["text"] == "bad-arguments"
@@ -123,7 +124,27 @@ def test_mcp_retry_reuses_the_id() -> None:
         [{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}}],
         lambda payload: {"ok": False, "error": "no-reply"},
     )
-    assert failed[0]["result"]["content"][0]["text"] == f"no-reply (message id {mid}; retry with this id)"
+    assert failed[0]["result"]["content"][0]["text"] == f"no-reply (message id {mid}; outcome unknown, retry with this id)"
+    # A terminal failure names the id but does not tell the model to reuse it.
+    terminal = _mcp_session(
+        [
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}},
+            {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "bad name!", "text": "t", "id": mid}}},
+        ],
+        lambda payload: {"ok": False, "error": "delivery-failed"},
+    )
+    assert terminal[0]["result"]["content"][0]["text"] == f"delivery-failed (message id {mid}; not retryable as is, send a new message with a new id)"
+    assert terminal[1]["result"]["content"][0]["text"].startswith(f"bad-name (message id {mid}")
+    # A reply whose id cannot be UTF-8 is escaped, not a crash.
+    odd = _mcp_session([{"jsonrpc": "2.0", "id": "\ud800", "method": "ping"}], lambda p: {})
+    assert odd[0]["id"] == "\ud800" and odd[0]["result"] == {}
+    # A 32,000-character text of emoji, escaped by a client, is under the line limit.
+    big = "\U0001F600" * 32_000
+    stdin = io.BytesIO(json.dumps({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": big}}}, ensure_ascii=True).encode() + b"\n")
+    assert len(stdin.getvalue()) > 300 * 1024
+    stdout = io.BytesIO()
+    serve_stdio("grok-aima", lambda p: {"ok": True, "id": p["id"], "waiting": False}, stdin=stdin, stdout=stdout)
+    assert "accepted" in json.loads(stdout.getvalue())["result"]["content"][0]["text"]
 
 
 # --- Store -------------------------------------------------------------------
@@ -141,17 +162,44 @@ def test_broker_stamps_time_and_replays_in_order(tmp_path: Path) -> None:
     ids = [str(uuid.uuid4()) for _ in range(20)]
     for i, mid in enumerate(ids):
         store.insert_message(mid, "alpha", "beta", f"m{i}", "next")
-    rows = store.queued("beta")
-    assert [r["text"] for r in rows] == [f"m{i}" for i in range(20)]
-    assert all(r["created_at"].endswith("+00:00") for r in rows)
+    # The broker's whole send path is head -> due -> claim -> ack, one at a time.
+    out = []
+    while (head := store.head("beta")) is not None:
+        assert store.due(head)
+        assert store.claim(head["id"])
+        out.append(head["text"])
+        store.ack(head["id"])
+    assert out == [f"m{i}" for i in range(20)]
+    assert all(store.get_message(mid)["created_at"].endswith("+00:00") for mid in ids)
+
+
+def test_a_lost_ack_does_not_block_a_name_forever(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    store.insert_message(first, "alpha", "beta", "m1", "next")
+    store.insert_message(second, "alpha", "beta", "m2", "next")
+    stamp = store.claim(first)
+    assert stamp and not store.stale(store.head("beta"))
+    store.conn.execute("UPDATE messages SET delivered_at='2000-01-01T00:00:00.000000+00:00' WHERE id=?", (first,))
+    store.conn.commit()
+    assert store.stale(store.head("beta"))
+    assert store.nack(first) == "queued"
+    assert store.get_message(first)["attempts"] == 1
+    # A rollback carries the stamp of the claim that made it, so it cannot undo a newer claim.
+    store.conn.execute("UPDATE messages SET state='delivered', delivered_at='later' WHERE id=?", (first,))
+    store.conn.commit()
+    store.requeue_id(first, stamp)
+    assert store.get_message(first)["state"] == "delivered"
+    store.requeue_id(first, "later")
+    assert store.get_message(first)["state"] == "queued"
 
 
 def test_claim_is_single_winner_and_ack_is_final(tmp_path: Path) -> None:
     store = _store(tmp_path)
     mid = str(uuid.uuid4())
     store.insert_message(mid, "alpha", "beta", "x", "next")
-    assert store.claim(mid) is True
-    assert store.claim(mid) is False
+    assert store.claim(mid)  # the claim stamp
+    assert store.claim(mid) is None
     store.ack(mid)
     store.requeue_id(mid)
     store.requeue_name("beta")
@@ -167,8 +215,7 @@ def test_nack_backs_off_then_gives_up(tmp_path: Path) -> None:
     assert store.nack(mid) == "queued"
     row = store.get_message(mid)
     assert row["attempts"] == 1 and row["not_before"] > row["created_at"]
-    assert store.queued("beta") == []  # not yet due
-    assert store.due(store.head("beta")) is False  # and nothing goes out for beta until it is
+    assert store.due(store.head("beta")) is False  # not yet due; nothing goes out for beta until it is
     for _ in range(MAX_ATTEMPTS - 2):
         store.conn.execute("UPDATE messages SET state='delivered' WHERE id=?", (mid,))
         store.conn.commit()
@@ -295,9 +342,19 @@ def test_existing_directories_keep_their_mode(tmp_path: Path) -> None:
 
 
 def test_wake_file_must_be_a_regular_file(tmp_path: Path) -> None:
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
     fifo = tmp_path / "wake.fifo"
     os.mkfifo(fifo)
-    assert deliver_wake({"wake": str(fifo)}, {"id": "m", "from": "a", "to": "b", "text": "t"}) is False
+    assert deliver_wake({"wake": str(fifo)}, msg) is False  # no reader: the open fails
+    # A device opens fine; the descriptor check is what refuses it.
+    assert deliver_wake({"wake": "/dev/null"}, msg) is False
+    # A symlink in the file's place is refused too.
+    real = tmp_path / "real.jsonl"
+    real.write_text("")
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(real)
+    assert deliver_wake({"wake": str(link)}, msg) is False
+    assert real.read_text() == ""
 
 
 def test_wrapper_tag_cannot_be_forged() -> None:
@@ -474,7 +531,7 @@ async def _mesh(tmp_path: Path) -> None:
         who = await relay_a.local_who()
         assert [a["failed"] for a in who["agents"] if a["name"] == "beta"] == [1]
 
-        # Large non-ASCII text goes through the local socket.
+        # Large non-ASCII text goes through the local socket; an over-long line is named as such.
         big = "漢" * 30_000
         reader, writer = await asyncio.open_unix_connection(str(relay_a.socket_path))
         writer.write((json.dumps({"op": "send", "from": "alpha", "to": "beta", "text": big}, ensure_ascii=False) + "\n").encode())
@@ -483,6 +540,28 @@ async def _mesh(tmp_path: Path) -> None:
         writer.close()
         assert reply["ok"] is True, reply
         await _until(lambda: big in rec_b.texts())
+        reader, writer = await asyncio.open_unix_connection(str(relay_a.socket_path))
+        writer.write(b'{"op":"send","text":"' + b"x" * (300 * 1024) + b'"}\n')
+        await writer.drain()
+        reply = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        writer.close()
+        assert reply == {"ok": False, "error": "too-large"}
+
+        # A send whose frame never reaches the broker fails as broker-down and frees its id.
+        real_send = relay_a.ws.send
+
+        async def broken(data):
+            raise OSError("link gone")
+
+        relay_a.ws.send = broken
+        lost = str(uuid.uuid4())
+        with pytest.raises(Exception) as info:
+            await relay_a.local_send("alpha", "beta", "lost", mid=lost)
+        assert getattr(info.value, "code", "") == "broker-down"
+        relay_a.ws.send = real_send
+        assert lost not in relay_a.waiters
+        res = await relay_a.local_send("alpha", "beta", "lost", mid=lost)
+        assert res["ok"]
 
         # Two callers with one id: the second is told the id is in flight, not given the first's reply.
         twin = str(uuid.uuid4())

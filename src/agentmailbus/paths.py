@@ -31,7 +31,13 @@ def private_dir(path: Path) -> Path:
             if not component.is_dir():
                 raise NotADirectoryError(str(component)) from None
             continue
-        fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        except PermissionError:
+            # An umask that strips the owner's bits left a directory nobody can open.
+            # It was created a moment ago by this call, so set it by name.
+            os.chmod(component, 0o700)
+            continue
         try:
             os.fchmod(fd, 0o700)
         finally:

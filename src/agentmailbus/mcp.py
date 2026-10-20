@@ -95,13 +95,16 @@ def _call(mid, params: dict, sender: str, rpc) -> dict:
     if not isinstance(args, dict):
         return _tool_error(mid, "bad-arguments")
     try:
-        recipient = check_name(args.get("to"), "to")
-        text = check_text(args.get("text"))
-        priority = check_priority(args.get("priority"))
         msg_id = check_id(args["id"]) if args.get("id") else str(uuid.uuid4())
     except ProtocolError as exc:
         return _tool_error(mid, exc.code)
-    # From here on the id exists, and every failure names it so a retry is the same message.
+    # From here on the id exists, and every failure names it.
+    try:
+        recipient = check_name(args.get("to"), "to")
+        text = check_text(args.get("text"))
+        priority = check_priority(args.get("priority"))
+    except ProtocolError as exc:
+        return _tool_error(mid, _named(exc.code, msg_id))
     payload = {
         "op": "send",
         "id": msg_id,
@@ -129,8 +132,19 @@ def _call(mid, params: dict, sender: str, rpc) -> dict:
     }
 
 
+# Errors that the same message can never get past. Retrying them with the same id
+# would fail the same way; the id is named for the record only.
+TERMINAL = {
+    "delivery-failed", "id-conflict", "unknown-agent", "sender-offline", "not-registered",
+    "not-your-agent", "bad-name", "bad-text", "empty-text", "too-large", "bad-priority",
+    "bad-id", "unknown-tool", "bad-arguments",
+}
+
+
 def _named(code: str, msg_id: str) -> str:
-    return f"{code} (message id {msg_id}; retry with this id)"
+    if code in TERMINAL:
+        return f"{code} (message id {msg_id}; not retryable as is, send a new message with a new id)"
+    return f"{code} (message id {msg_id}; outcome unknown, retry with this id)"
 
 
 def _tool_error(mid, code: str) -> dict:
@@ -170,7 +184,13 @@ def read_message(stream):
 
 
 def write_message(stream, obj) -> None:
-    stream.write((json.dumps(obj, ensure_ascii=False) + "\n").encode())
+    text = json.dumps(obj, ensure_ascii=False)
+    try:
+        data = text.encode()
+    except UnicodeEncodeError:
+        # A lone surrogate in a client-supplied id cannot be UTF-8; escape it instead.
+        data = json.dumps(obj, ensure_ascii=True).encode()
+    stream.write(data + b"\n")
     stream.flush()
 
 

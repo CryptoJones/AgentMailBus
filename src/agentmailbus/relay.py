@@ -73,6 +73,9 @@ class Relay:
         self.reg_lock = asyncio.Lock()
         self.inbox: asyncio.Queue | None = None
         self.next_prune = 0.0
+        # Ids that were written but could not be recorded in the seen store. Kept in
+        # memory so a reconnect inside this process does not inject them again.
+        self.seen_fallback: set[str] = set()
 
     async def run(self) -> None:
         await self._listen()
@@ -141,8 +144,9 @@ class Relay:
             raise BrokerRefused(welcome.get("error", "no welcome"))
         log.info("connected to %s as %s", self.url, self.host_id)
         self.connected.set()
-        # The broker keeps one message in flight per name, so this holds at most one
-        # frame per registered name. The read loop never waits on it.
+        # The broker keeps one message in flight per name, so this holds about one
+        # frame per registered name (a re-register can add a stale copy, which the
+        # seen set absorbs). The read loop never waits on it.
         self.inbox = asyncio.Queue()
         reader = asyncio.create_task(self._read(ws))
         poller = asyncio.create_task(self._poll())
@@ -229,10 +233,14 @@ class Relay:
             loop = asyncio.get_running_loop()
             fut: asyncio.Future = loop.create_future()
             self.waiters[f"reg:{name}"] = fut
-            async with self.send_lock:
-                await self.ws.send(
-                    dumps({"type": "register", "name": name, "harness": binding["harness"]})
-                )
+            try:
+                async with self.send_lock:
+                    await self.ws.send(
+                        dumps({"type": "register", "name": name, "harness": binding["harness"]})
+                    )
+            except Exception:
+                self.waiters.pop(f"reg:{name}", None)
+                return
             try:
                 msg = await asyncio.wait_for(fut, 5)
             except asyncio.TimeoutError:
@@ -294,7 +302,7 @@ class Relay:
         mid = str(msg.get("id") or "")
         if not mid:
             return
-        if self.seen.done(mid):
+        if mid in self.seen_fallback or self.seen.done(mid):
             await self._ack(mid)
             return
         to = msg.get("to")
@@ -323,12 +331,15 @@ class Relay:
             self.seen.mark(mid)
         except Exception as exc:
             log.warning("could not record %s as seen: %s", mid, type(exc).__name__)
+            self.seen_fallback.add(mid)
+        await self._ack(mid)
+        # The note is bookkeeping; the next message for this name waits on the ack,
+        # so it goes out before the note is written.
         if self.omi.enabled:
             try:
                 await asyncio.to_thread(self.omi.write, msg)
             except Exception as exc:
                 log.warning("omi mirror raised for %s: %s", mid, type(exc).__name__)
-        await self._ack(mid)
 
     async def _ack(self, mid: str) -> None:
         await self._signal("ack", mid)

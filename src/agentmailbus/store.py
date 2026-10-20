@@ -11,6 +11,9 @@ from agentmailbus.paths import private_dir
 
 MAX_ATTEMPTS = 20
 MAX_BACKOFF = 60.0
+# A delivered row with no ack or nack after this long counts as a failed attempt.
+# Adapters time out in 5 s and the OMI note in 30 s, so a live relay answers well inside it.
+DELIVERY_TIMEOUT = 120.0
 RETENTION_DAYS = 7
 # The relay remembers ids longer than the broker keeps finished rows, so a row the
 # broker requeues after a long outage is still recognised. See PROTOCOL.md.
@@ -68,7 +71,8 @@ class BrokerStore:
                 state TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 not_before TEXT NOT NULL DEFAULT '',
-                finished_at TEXT NOT NULL DEFAULT ''
+                finished_at TEXT NOT NULL DEFAULT '',
+                delivered_at TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS messages_q ON messages(recipient, state);
             """
@@ -84,6 +88,8 @@ class BrokerStore:
             self.conn.execute("ALTER TABLE messages ADD COLUMN not_before TEXT NOT NULL DEFAULT ''")
         if "finished_at" not in cols:
             self.conn.execute("ALTER TABLE messages ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''")
+        if "delivered_at" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN delivered_at TEXT NOT NULL DEFAULT ''")
         # Rows from before the broker stamped time: date them now so they age normally
         # instead of being pruned on the first pass.
         now = _now()
@@ -177,14 +183,21 @@ class BrokerStore:
     def due(self, row: dict) -> bool:
         return row["state"] == "queued" and row["not_before"] <= _now()
 
-    def claim(self, mid: str) -> bool:
-        """Move one queued row to delivered. False when another path already took it."""
+    def stale(self, row: dict, timeout: float = DELIVERY_TIMEOUT) -> bool:
+        """A delivered row whose ack or nack is overdue."""
+        return row["state"] == "delivered" and row["delivered_at"] < _before(timeout / 86400.0)
+
+    def claim(self, mid: str) -> str | None:
+        """Move one queued row to delivered. Returns the claim stamp, or None when
+        another path already took it. The stamp lets a failed send roll back only
+        its own claim and not a newer one."""
+        stamp = _now()
         cur = self.conn.execute(
-            "UPDATE messages SET state='delivered' WHERE id=? AND state='queued'",
-            (mid,),
+            "UPDATE messages SET state='delivered', delivered_at=? WHERE id=? AND state='queued'",
+            (stamp, mid),
         )
         self.conn.commit()
-        return cur.rowcount == 1
+        return stamp if cur.rowcount == 1 else None
 
     def ack(self, mid: str) -> None:
         if mid:
@@ -214,17 +227,6 @@ class BrokerStore:
         self.conn.commit()
         return state
 
-    def queued(self, name: str) -> list[dict]:
-        rows = self.conn.execute(
-            """
-            SELECT rowid, * FROM messages
-            WHERE recipient=? AND state='queued' AND not_before<=?
-            ORDER BY rowid
-            """,
-            (name, _now()),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
     def requeue_host(self, host: str) -> None:
         self.conn.execute(
             """
@@ -242,13 +244,20 @@ class BrokerStore:
         )
         self.conn.commit()
 
-    def requeue_id(self, mid: str) -> None:
+    def requeue_id(self, mid: str, stamp: str | None = None) -> None:
+        """Put one delivered row back. With `stamp`, only the claim that made it."""
         if not mid:
             return
-        self.conn.execute(
-            "UPDATE messages SET state='queued' WHERE state='delivered' AND id=?",
-            (mid,),
-        )
+        if stamp is None:
+            self.conn.execute(
+                "UPDATE messages SET state='queued' WHERE state='delivered' AND id=?",
+                (mid,),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE messages SET state='queued' WHERE state='delivered' AND id=? AND delivered_at=?",
+                (mid, stamp),
+            )
         self.conn.commit()
 
     def prune(self, days: float = RETENTION_DAYS) -> int:

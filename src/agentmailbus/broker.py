@@ -230,14 +230,22 @@ class Broker:
         went out.
         """
         head = self.store.head(name)
+        if head is not None and self.store.stale(head):
+            # The relay never answered for this one. Count it as a failed attempt so
+            # the name cannot stay blocked behind a lost ack; the relay's seen set
+            # absorbs a late duplicate.
+            log.warning("no ack for %s to %s; handing it back", head["id"], name)
+            self.store.nack(head["id"])
+            head = self.store.head(name)
         if head is None or not self.store.due(head):
             return False
-        if not self.store.claim(head["id"]):
+        stamp = self.store.claim(head["id"])
+        if stamp is None:
             return False
         try:
             await ws.send(dumps(_deliver_frame(head)))
         except Exception:
-            self.store.requeue_id(head["id"])
+            self.store.requeue_id(head["id"], stamp)
             raise
         return True
 
