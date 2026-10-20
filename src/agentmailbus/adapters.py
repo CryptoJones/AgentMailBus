@@ -16,6 +16,7 @@ import socket
 import stat
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 
 from agentmailbus.paths import private_dir
@@ -115,14 +116,23 @@ def deliver_claude(binding: dict, message: dict) -> bool:
 
 _wake_locks: dict[str, threading.Lock] = {}
 _wake_locks_guard = threading.Lock()
+_WAKE_LOCKS_CAP = 256
 
 
 def _wake_lock(path: Path) -> threading.Lock:
-    """One lock per wake path. Two names may share a file; their writes never overlap."""
+    """One lock per wake path. Two names may share a file; their writes never overlap.
+
+    The table is pruned of locks nobody holds once it passes the cap, so a wrapper
+    that mints a new path per session does not grow it without bound.
+    """
     key = os.path.realpath(path)
     with _wake_locks_guard:
         lock = _wake_locks.get(key)
         if lock is None:
+            if len(_wake_locks) >= _WAKE_LOCKS_CAP:
+                for other, held in list(_wake_locks.items()):
+                    if not held.locked():
+                        del _wake_locks[other]
             lock = _wake_locks[key] = threading.Lock()
         return lock
 
@@ -153,7 +163,7 @@ def _append_line(path: Path, payload: bytes) -> bool:
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return False
-        start = os.fstat(fd).st_size
+        start = _terminated(fd)
         done = 0
         try:
             while data:
@@ -164,8 +174,8 @@ def _append_line(path: Path, payload: bytes) -> bool:
                 done += written
         except OSError:
             # Part of a line is in the file. Take it back out, but only if nothing
-            # else landed after it; otherwise end the fragment with a newline so a
-            # line reader skips it. Either way this delivery is not complete.
+            # else landed after it; otherwise end what is there with a newline so a
+            # line reader moves past it. Either way this delivery is not complete.
             if done:
                 _unwrite(fd, path, start, done)
             return False
@@ -183,6 +193,16 @@ def _append_line(path: Path, payload: bytes) -> bool:
     return True
 
 
+def _terminated(fd: int) -> int:
+    """Make sure the file ends on a newline (a crash can leave a torn tail) and
+    return the offset this line will start at."""
+    size = os.fstat(fd).st_size
+    if size and os.pread(fd, 1, size - 1) != b"\n":
+        os.write(fd, b"\n")
+        size += 1
+    return size
+
+
 def _unwrite(fd: int, path: Path, start: int, done: int) -> None:
     try:
         if os.fstat(fd).st_size == start + done:
@@ -197,39 +217,44 @@ def _unwrite(fd: int, path: Path, start: int, done: int) -> None:
     log.warning("partial wake line left in %s", path)
 
 
+_WAKE_FLAGS = os.O_RDWR | os.O_APPEND | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
 def _open_wake(path: Path) -> int | None:
-    """Open the wake file for append. A file created here is made 0600 through its
-    descriptor, whatever the umask. O_NONBLOCK keeps a FIFO without a reader from
-    hanging the open; O_NOFOLLOW refuses a symlink in the file's place."""
-    base = os.O_APPEND | os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    """Open the wake file for append; create it if missing.
+
+    A new file is created under a private temporary name, made 0600 through its
+    descriptor whatever the umask, and then linked into place, so the wake path
+    never names a half-made file. An existing file keeps its mode. O_NONBLOCK keeps
+    a FIFO without a reader from hanging the open; O_NOFOLLOW refuses a symlink.
+    """
     try:
-        fd = os.open(path, base | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return _open_existing(path, base)
+        return os.open(path, _WAKE_FLAGS)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError:
         return None
     try:
         os.fchmod(fd, 0o600)
-    except OSError:
-        os.close(fd)
-        return None
-    return fd
-
-
-def _open_existing(path: Path, flags: int) -> int | None:
-    try:
-        return os.open(path, flags)
-    except PermissionError:
-        # A relay killed between creating the file and setting its mode leaves a
-        # mode-000 file of our own. Repair that one case by name and try once more.
         try:
-            st = os.lstat(path)
-            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and (st.st_mode & 0o777) == 0:
-                os.chmod(path, 0o600)
-                return os.open(path, flags)
+            os.link(tmp, path)
+        except FileExistsError:
+            pass  # another writer made it first; open theirs below
+        except OSError:
+            return None
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(tmp)
         except OSError:
             pass
-        return None
+    try:
+        return os.open(path, _WAKE_FLAGS)
     except OSError:
         return None
 

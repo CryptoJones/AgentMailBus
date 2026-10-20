@@ -195,6 +195,14 @@ def test_a_lost_ack_does_not_block_a_name_forever(tmp_path: Path) -> None:
     assert store.stale(store.head("beta"))
     assert store.nack(first) == "queued"
     assert store.get_message(first)["attempts"] == 1
+    # A row handed back by a drop or restart keeps attempts 0 but was handed out: its late ack counts.
+    assert store.claim(second)
+    store.requeue_name("beta")
+    assert store.get_message(second)["state"] == "queued" and store.get_message(second)["attempts"] == 0
+    store.ack(second)
+    assert store.get_message(second)["state"] == "acked"
+    store.conn.execute("UPDATE messages SET state='queued', delivered_at='' WHERE id=?", (second,))
+    store.conn.commit()
     # A late ack finishes a row the broker gave up on; an ack for a row never handed out is ignored.
     store.conn.execute("UPDATE messages SET state='failed', attempts=20 WHERE id=?", (first,))
     store.conn.commit()
@@ -837,9 +845,25 @@ def test_wake_partial_write_is_taken_back_or_fenced(tmp_path: Path, monkeypatch:
     assert json.loads(last)["id"] == "m"
 
 
-def test_wake_writers_sharing_a_file_never_interleave(tmp_path: Path) -> None:
+def test_wake_writers_sharing_a_file_never_interleave(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     wake = tmp_path / "shared.jsonl"
     text = "x" * 20_000
+    real_write = os.write
+
+    def torn_write(fd, data):
+        # Every line goes out in two pieces with a yield in between, so without the
+        # per-path lock the three writers would interleave their halves.
+        data = bytes(data)
+        if len(data) <= 1:
+            return real_write(fd, data)
+        half = len(data) // 2
+        n = real_write(fd, data[:half])
+        import time as _t
+
+        _t.sleep(0.001)
+        return n  # a short write; the caller writes the rest
+
+    monkeypatch.setattr(adapters.os, "write", torn_write)
 
     def writer(name: str) -> None:
         for i in range(30):
@@ -850,9 +874,24 @@ def test_wake_writers_sharing_a_file_never_interleave(tmp_path: Path) -> None:
         t.start()
     for t in threads:
         t.join()
+    monkeypatch.setattr(adapters.os, "write", real_write)
     lines = wake.read_text().splitlines()
     assert len(lines) == 90
     assert all(json.loads(line)["text"] == text for line in lines)
+    assert sorted(json.loads(line)["id"] for line in lines) == sorted(f"{n}-{i}" for n in ("grok", "orca", "third") for i in range(30))
+
+
+def test_wake_crash_fragment_is_terminated_before_the_next_line(tmp_path: Path) -> None:
+    wake = tmp_path / "w.jsonl"
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    assert deliver_wake({"wake": str(wake)}, msg)
+    with open(wake, "ab") as crashed:
+        crashed.write(b'{"id":"torn","fr')  # a relay killed mid-write
+    assert deliver_wake({"wake": str(wake)}, {**msg, "id": "after"})
+    lines = wake.read_bytes().split(b"\n")
+    assert lines[1] == b'{"id":"torn","fr'  # the fragment is its own (bad) line
+    assert json.loads(lines[2])["id"] == "after"  # and the next line is clean
+    assert lines[-1] == b""
 
 
 def test_idle_delivery_worker_goes_away(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

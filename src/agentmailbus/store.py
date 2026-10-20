@@ -207,14 +207,14 @@ class BrokerStore:
 
     def ack(self, mid: str) -> None:
         """An ack always means the relay wrote the message. It finishes the row even
-        if the broker has meanwhile counted it as overdue and requeued it, or given
-        up on it. A row that was never handed out (attempts 0, still queued) is not
-        touched: no relay can have written it."""
+        if the broker has meanwhile handed it back (a deadline, a drop, a restart) or
+        given up on it. A row that was never handed out, which `delivered_at` records,
+        is not touched: no relay can have written it."""
         if mid:
             self.conn.execute(
                 """
                 UPDATE messages SET state='acked', finished_at=?
-                WHERE id=? AND (state='delivered' OR (state IN ('queued', 'failed') AND attempts > 0))
+                WHERE id=? AND (state='delivered' OR (state IN ('queued', 'failed') AND delivered_at != ''))
                 """,
                 (_now(), mid),
             )
