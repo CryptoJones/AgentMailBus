@@ -1,0 +1,8 @@
+# One relay per host. Point broker at pluto.
+broker = "ws://172.16.28.254:8770"
+token = "pass:agentmailbus/token"
+host = ""
+socket = "~/.local/share/agentmailbus/relay.sock"
+registry = "~/.local/share/agentmailbus/sessions"
+state = "~/.local/share/agentmailbus/relay.db"
+omi = true

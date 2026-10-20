@@ -1,0 +1,9 @@
+[mcp_servers.agentmailbus]
+command = "agentmailbus"
+args = [
+  "mcp",
+  "--from", "grok-aima",
+  "--harness", "grok",
+  "--wake", "~/.local/share/agentmailbus/inbox/grok-aima.jsonl",
+]
+enabled = true

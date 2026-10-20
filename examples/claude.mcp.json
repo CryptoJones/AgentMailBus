@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agentmailbus": {
+      "command": "agentmailbus",
+      "args": ["mcp", "--from", "rea-63", "--harness", "claude"]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=AgentMailBus broker
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/agentmailbus/venv/bin/agentmailbus broker --config %h/.config/agentmailbus/broker.toml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

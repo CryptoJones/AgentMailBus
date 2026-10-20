@@ -1,0 +1,11 @@
+[Unit]
+Description=AgentMailBus relay
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/agentmailbus/venv/bin/agentmailbus relay --config %h/.config/agentmailbus/relay.toml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
