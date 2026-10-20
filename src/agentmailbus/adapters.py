@@ -12,6 +12,7 @@ import json
 import os
 import re
 import socket
+import stat
 import tempfile
 from pathlib import Path
 
@@ -123,12 +124,17 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         ensure_ascii=False,
     )
     data = memoryview((line + "\n").encode())
-    if path.exists() and not path.is_file():
-        # A FIFO or device would block or misbehave; the wake file is a regular file.
-        return False
+    existed = path.exists()
+    # O_NONBLOCK keeps a FIFO without a reader from hanging the open; the fstat
+    # check below is what guarantees the bytes land in a regular file.
     flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_NONBLOCK", 0)
-    fd = os.open(path, flags, 0o600)
     try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
         while data:
             written = os.write(fd, data)
             if written <= 0:
@@ -137,7 +143,8 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.chmod(path, 0o600)
+    if not existed:
+        os.chmod(path, 0o600)
     return True
 
 

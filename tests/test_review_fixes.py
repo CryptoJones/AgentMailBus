@@ -17,7 +17,7 @@ from agentmailbus.cli import _run_relay
 from agentmailbus.mcp import serve_stdio
 from agentmailbus.net import parse_allow
 from agentmailbus.paths import private_dir
-from agentmailbus.protocol import check_id, dumps
+from agentmailbus.protocol import ProtocolError, check_id, check_text, dumps
 from agentmailbus.registry import load_live, pid_alive, remove_binding, save_binding
 from agentmailbus.relay import Relay
 from agentmailbus.store import MAX_ATTEMPTS, BrokerStore, SeenStore
@@ -77,7 +77,10 @@ def test_mcp_survives_a_relay_outage_and_bad_input() -> None:
         b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":[1,2]}\n'
         b'{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"send","arguments":"x"}}\n'
         b"\xff\xfe{}\n"
-        + b'{"jsonrpc":"2.0","id":10,"method":"ping","params":"' + b"x" * (300 * 1024) + b'"}\n'
+        + b'{"jsonrpc":"2.0","id":10,"method":"ping","params":"' + b"x" * (1100 * 1024) + b'"}\n'
+        b"null\n"
+        b"[]\n"
+        + b"[" * 100000 + b"]" * 100000 + b"\n"
         b'{"jsonrpc":"2.0","id":6,"method":"ping"}\n'
     )
     stdout = io.BytesIO()
@@ -85,13 +88,16 @@ def test_mcp_survives_a_relay_outage_and_bad_input() -> None:
     replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
     assert replies[0]["id"] == 5
     assert replies[0]["result"]["isError"] is True
-    assert replies[0]["result"]["content"][0]["text"].startswith("relay-down (retry with id ")
+    assert replies[0]["result"]["content"][0]["text"].startswith("relay-down (message id ")
     assert replies[1]["error"]["code"] == -32700
     assert replies[2]["id"] == 7 and replies[2]["result"]["isError"] is True
     assert replies[3]["id"] == 8 and replies[3]["result"]["content"][0]["text"] == "bad-arguments"
     assert replies[4]["error"]["code"] == -32700
-    assert replies[5]["error"]["code"] == -32600
-    assert replies[6] == {"jsonrpc": "2.0", "id": 6, "result": {}}
+    assert replies[5]["error"]["code"] == -32600  # too large, id unknowable
+    assert replies[6]["error"]["code"] == -32600  # null is a value, not the end of input
+    assert replies[7]["error"]["code"] == -32600  # empty batch
+    assert replies[8]["error"]["code"] == -32700  # too deep to parse
+    assert replies[9] == {"jsonrpc": "2.0", "id": 6, "result": {}}
 
 
 def test_mcp_retry_reuses_the_id() -> None:
@@ -112,6 +118,12 @@ def test_mcp_retry_reuses_the_id() -> None:
     )
     assert seen == [mid, mid]
     assert replies[2]["result"]["content"][0]["text"] == "bad-id"
+    # Every failure after the id exists names it, whatever the relay said.
+    failed = _mcp_session(
+        [{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}}],
+        lambda payload: {"ok": False, "error": "no-reply"},
+    )
+    assert failed[0]["result"]["content"][0]["text"] == f"no-reply (message id {mid}; retry with this id)"
 
 
 # --- Store -------------------------------------------------------------------
@@ -156,7 +168,7 @@ def test_nack_backs_off_then_gives_up(tmp_path: Path) -> None:
     row = store.get_message(mid)
     assert row["attempts"] == 1 and row["not_before"] > row["created_at"]
     assert store.queued("beta") == []  # not yet due
-    assert store.pushable(row) is False  # and a retried send may not jump the delay
+    assert store.due(store.head("beta")) is False  # and nothing goes out for beta until it is
     for _ in range(MAX_ATTEMPTS - 2):
         store.conn.execute("UPDATE messages SET state='delivered' WHERE id=?", (mid,))
         store.conn.commit()
@@ -168,15 +180,27 @@ def test_nack_backs_off_then_gives_up(tmp_path: Path) -> None:
     assert beta["queued"] == 0 and beta["failed"] == 1
 
 
-def test_push_never_overtakes_an_older_queued_row(tmp_path: Path) -> None:
+def test_one_message_in_flight_per_name(tmp_path: Path) -> None:
     store = _store(tmp_path)
     first, second = str(uuid.uuid4()), str(uuid.uuid4())
     store.insert_message(first, "alpha", "beta", "m1", "next")
     store.insert_message(second, "alpha", "beta", "m2", "next")
-    assert store.pushable(store.get_message(first)) is True
-    assert store.pushable(store.get_message(second)) is False
+    assert store.head("beta")["id"] == first and store.due(store.head("beta"))
     assert store.claim(first)
-    assert store.pushable(store.get_message(second)) is True
+    head = store.head("beta")
+    assert head["id"] == first and head["state"] == "delivered" and not store.due(head)
+    assert store.nack(first) == "queued"
+    assert store.head("beta")["id"] == first and not store.due(store.head("beta"))  # backing off, still ahead
+    store.conn.execute("UPDATE messages SET state='delivered' WHERE id=?", (first,))
+    store.conn.commit()
+    store.ack(first)
+    assert store.head("beta")["id"] == second and store.due(store.head("beta"))
+
+
+def test_text_must_be_encodable() -> None:
+    with pytest.raises(ProtocolError) as info:
+        check_text("hello \ud800")
+    assert info.value.code == "bad-text"
 
 
 def test_prune_uses_finish_time_and_dates_legacy_rows(tmp_path: Path) -> None:
@@ -260,6 +284,14 @@ def test_existing_directories_keep_their_mode(tmp_path: Path) -> None:
     assert (fresh.stat().st_mode & 0o777) == 0o700
     assert ((shared / "fresh").stat().st_mode & 0o777) == 0o700  # every created component
     assert (shared.stat().st_mode & 0o777) == 0o755
+    (shared / "afile").write_text("x")
+    with pytest.raises(NotADirectoryError):
+        private_dir(shared / "afile" / "sub")
+    # An existing wake file keeps the mode its owner gave it.
+    wake = shared / "w.jsonl"
+    os.chmod(wake, 0o644)
+    assert deliver_wake({"wake": str(wake)}, {"id": "m2", "from": "a", "from_host": "h", "to": "b", "text": "t"})
+    assert (wake.stat().st_mode & 0o777) == 0o644
 
 
 def test_wake_file_must_be_a_regular_file(tmp_path: Path) -> None:
@@ -393,7 +425,8 @@ async def _mesh(tmp_path: Path) -> None:
         assert conflict == {"ok": False, "id": mid, "error": "id-conflict"}
         assert "again" not in rec_a.texts()
 
-        # A nacked message keeps its place: a newer send waits behind it and arrives after it.
+        # A nacked message keeps its place: a newer send waits behind it and arrives after
+        # its successful retry, not merely after its failed attempt.
         rec_b.ok = False
         sticky = str(uuid.uuid4())
         res = await relay_a.local_send("alpha", "beta", "sticky", mid=sticky)
@@ -403,10 +436,11 @@ async def _mesh(tmp_path: Path) -> None:
         rec_b.ok = True
         later = await relay_a.local_send("alpha", "beta", "after-sticky")
         assert later["ok"] and later["waiting"] is True, later
+        await _until(lambda: broker.store.get_message(sticky)["state"] == "acked", seconds=8)
         await _until(lambda: "after-sticky" in rec_b.texts(), seconds=8)
         texts = rec_b.texts()
+        assert texts.count("sticky") == 2
         assert texts.index("after-sticky") > len(texts) - 1 - texts[::-1].index("sticky")
-        await _until(lambda: broker.store.get_message(sticky)["state"] == "acked")
 
         # Only the owning relay may ack, nack, or unregister a name.
         foreign = str(uuid.uuid4())
@@ -414,14 +448,13 @@ async def _mesh(tmp_path: Path) -> None:
         await relay_a.local_send("alpha", "beta", "foreign", mid=foreign)
         await _until(lambda: broker.store.get_message(foreign)["attempts"] == 1)
         await _until(lambda: broker.store.get_message(foreign)["state"] == "queued")
-        await relay_a.ws.send(dumps({"type": "ack", "id": foreign}))
         await relay_a.ws.send(dumps({"type": "unregister", "name": "beta"}))
         await asyncio.sleep(0.3)
-        assert broker.store.get_message(foreign)["state"] == "queued"
         assert broker.owner["beta"] == "host-b"
-        # Put the row in flight by hand, then nack it from the wrong relay and the right one.
+        # Put the row in flight by hand, then ack and nack it from the wrong relay, then the right one.
         broker.store.conn.execute("UPDATE messages SET state='delivered' WHERE id=?", (foreign,))
         broker.store.conn.commit()
+        await relay_a.ws.send(dumps({"type": "ack", "id": foreign}))
         await relay_a.ws.send(dumps({"type": "nack", "id": foreign}))
         await asyncio.sleep(0.3)
         assert broker.store.get_message(foreign)["state"] == "delivered"
@@ -505,12 +538,31 @@ async def _worker(tmp_path: Path) -> None:
         relay.seen.mark = mark_once
         boom = str(uuid.uuid4())
         await relay.local_send("alpha", "alpha", "boom", mid=boom)
-        await _until(lambda: broker.store.get_message(boom)["attempts"] == 1)
-        # The worker is still alive: the next message, and the retry, both get through.
+        # The bytes were written, so a failed seen-mark is logged and the message is
+        # acked, never handed back for a second injection.
+        await _until(lambda: broker.store.get_message(boom)["state"] == "acked")
+        assert broker.store.get_message(boom)["attempts"] == 0
+        # The worker is still alive and the next message gets through, exactly once each.
         await relay.local_send("alpha", "alpha", "next")
         await _until(lambda: "next" in rec.texts())
-        await _until(lambda: broker.store.get_message(boom)["state"] == "acked", seconds=6)
+        await asyncio.sleep(0.3)
+        assert rec.texts().count("boom") == 1 and rec.texts().count("next") == 1
         assert "host-a" in broker.conns
+        # A failure before the write is handed back and retried.
+        real_done = relay.seen.done
+        relay.seen.done = lambda mid: (_ for _ in ()).throw(RuntimeError("locked"))
+        pre = str(uuid.uuid4())
+        await relay.local_send("alpha", "alpha", "pre", mid=pre)
+        await _until(lambda: broker.store.get_message(pre)["attempts"] == 1)
+        relay.seen.done = real_done
+        await _until(lambda: broker.store.get_message(pre)["state"] == "acked", seconds=6)
+        assert rec.texts().count("pre") == 1
+        # The hourly seen-prune runs on the loop thread and works.
+        relay.seen.conn.execute("INSERT INTO seen(id, at) VALUES ('old', '2000-01-01T00:00:00.000000+00:00')")
+        relay.seen.conn.commit()
+        relay.next_prune = 0.0
+        relay.prune_seen()
+        assert not relay.seen.done("old")
         await relay.close()
         await task
     finally:

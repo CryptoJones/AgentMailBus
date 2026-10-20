@@ -22,9 +22,15 @@ def parse_allow(items: list[str] | tuple[str, ...]) -> tuple[ipaddress._BaseNetw
     return tuple(ipaddress.ip_network(item) for item in items)
 
 
-def ip_allowed(host: str, nets: tuple[ipaddress._BaseNetwork, ...]) -> bool:
+def normalize_ip(host: str) -> str:
+    """One spelling per address: a v4-mapped v6 address is its v4 form."""
     if host.startswith("::ffff:"):
-        host = host[7:]
+        return host[7:]
+    return host
+
+
+def ip_allowed(host: str, nets: tuple[ipaddress._BaseNetwork, ...]) -> bool:
+    host = normalize_ip(host)
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:

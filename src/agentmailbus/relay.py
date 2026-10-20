@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -27,8 +28,11 @@ from agentmailbus.wsutil import ws_connect
 
 log = logging.getLogger("agentmailbus.relay")
 
-INBOX_LIMIT = 256  # deliver frames waiting for the worker; beyond this the read loop waits
 SEEN_PRUNE_INTERVAL = 3600.0
+
+
+class BrokerRefused(RuntimeError):
+    """The broker answered the hello with an error instead of a welcome."""
 
 
 class LocalError(Exception):
@@ -68,10 +72,11 @@ class Relay:
         self.rejected: set[str] = set()
         self.reg_lock = asyncio.Lock()
         self.inbox: asyncio.Queue | None = None
+        self.next_prune = 0.0
 
     async def run(self) -> None:
         await self._listen()
-        self.seen.prune()
+        self.prune_seen()
         delay = self.backoff_start
         try:
             while not self.stop.is_set():
@@ -81,7 +86,7 @@ class Relay:
                         await self._session(ws)
                 except asyncio.CancelledError:
                     raise
-                except RuntimeError as exc:
+                except BrokerRefused as exc:
                     log.warning("broker refused %s: %s", self.host_id, exc)
                 except Exception as exc:
                     log.warning(
@@ -133,10 +138,12 @@ class Relay:
         raw = await asyncio.wait_for(ws.recv(), 5)
         welcome = loads(raw)
         if welcome.get("type") != "welcome":
-            raise RuntimeError(welcome.get("error", "no welcome"))
+            raise BrokerRefused(welcome.get("error", "no welcome"))
         log.info("connected to %s as %s", self.url, self.host_id)
         self.connected.set()
-        self.inbox = asyncio.Queue(maxsize=INBOX_LIMIT)
+        # The broker keeps one message in flight per name, so this holds at most one
+        # frame per registered name. The read loop never waits on it.
+        self.inbox = asyncio.Queue()
         reader = asyncio.create_task(self._read(ws))
         poller = asyncio.create_task(self._poll())
         worker = asyncio.create_task(self._deliver_loop(self.inbox))
@@ -156,19 +163,12 @@ class Relay:
             self.inbox = None
 
     async def _poll(self) -> None:
-        loop = asyncio.get_running_loop()
-        next_prune = loop.time() + SEEN_PRUNE_INTERVAL
         while not self.stop.is_set():
             try:
                 await self.sync()
             except Exception as exc:
                 log.warning("registry sync failed: %s", type(exc).__name__)
-            if loop.time() >= next_prune:
-                next_prune = loop.time() + SEEN_PRUNE_INTERVAL
-                try:
-                    await asyncio.to_thread(self.seen.prune)
-                except Exception as exc:
-                    log.warning("seen prune failed: %s", type(exc).__name__)
+            self.prune_seen()
             try:
                 await asyncio.wait_for(self.stop.wait(), 1)
                 return
@@ -180,6 +180,21 @@ class Relay:
                         await self.ws.send(dumps({"type": "pull"}))
                 except Exception:
                     log.warning("queue pull failed for %s", self.host_id)
+
+    def prune_seen(self) -> None:
+        """Drop old seen ids about once an hour. Runs on the loop thread: the sqlite
+        connection was opened there and will not serve another thread. The deadline
+        lives on the relay, so reconnects do not push it back."""
+        now = time.monotonic()
+        if now < self.next_prune:
+            return
+        self.next_prune = now + SEEN_PRUNE_INTERVAL
+        try:
+            dropped = self.seen.prune()
+            if dropped:
+                log.info("pruned %d seen ids", dropped)
+        except Exception as exc:
+            log.warning("seen prune failed: %s", type(exc).__name__)
 
     async def sync(self) -> None:
         """Match the broker's view to the session files: new, gone, and changed bindings."""
@@ -242,7 +257,7 @@ class Relay:
             kind = msg.get("type")
             if kind == "deliver":
                 if self.inbox is not None:
-                    await self.inbox.put(msg)
+                    self.inbox.put_nowait(msg)
                 continue
             key = None
             if kind in {"registered", "error"} and msg.get("name"):
@@ -302,9 +317,17 @@ class Relay:
         if not ok:
             await self._nack(mid)
             return
-        self.seen.mark(mid)
+        # The bytes are in the session. From here on nothing may turn into a nack,
+        # or the broker would hand the same message back for a second injection.
+        try:
+            self.seen.mark(mid)
+        except Exception as exc:
+            log.warning("could not record %s as seen: %s", mid, type(exc).__name__)
         if self.omi.enabled:
-            await asyncio.to_thread(self.omi.write, msg)
+            try:
+                await asyncio.to_thread(self.omi.write, msg)
+            except Exception as exc:
+                log.warning("omi mirror raised for %s: %s", mid, type(exc).__name__)
         await self._ack(mid)
 
     async def _ack(self, mid: str) -> None:
@@ -351,19 +374,24 @@ class Relay:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self.waiters[mid] = fut
-        async with self.send_lock:
-            await self.ws.send(
-                dumps(
-                    {
-                        "type": "send",
-                        "id": mid,
-                        "from": sender,
-                        "to": recipient,
-                        "text": text,
-                        "priority": priority,
-                    }
+        try:
+            async with self.send_lock:
+                await self.ws.send(
+                    dumps(
+                        {
+                            "type": "send",
+                            "id": mid,
+                            "from": sender,
+                            "to": recipient,
+                            "text": text,
+                            "priority": priority,
+                        }
+                    )
                 )
-            )
+        except Exception:
+            # Nothing reached the broker; the id must not stay marked in flight.
+            self.waiters.pop(mid, None)
+            raise LocalError("broker-down") from None
         try:
             msg = await asyncio.wait_for(fut, 15)
         except asyncio.TimeoutError:
@@ -418,6 +446,9 @@ class Relay:
             out = {"ok": False, "error": exc.code}
         except ProtocolError as exc:
             out = {"ok": False, "error": exc.code}
+        except ValueError:
+            # asyncio's readline raises ValueError for a line over the limit.
+            out = {"ok": False, "error": "too-large"}
         except asyncio.TimeoutError:
             out = {"ok": False, "error": "timeout"}
         except Exception:

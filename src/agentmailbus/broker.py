@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
-from agentmailbus.net import ip_allowed, tokens_equal
+from agentmailbus.net import ip_allowed, normalize_ip, tokens_equal
 from agentmailbus.protocol import (
     MAX_FRAME,
     ProtocolError,
@@ -79,35 +79,23 @@ class Broker:
     async def handler(self, ws) -> None:
         peer = ""
         if ws.remote_address:
-            peer = ws.remote_address[0]
+            peer = normalize_ip(ws.remote_address[0])
         if not ip_allowed(peer, self.allow):
             await ws.close(code=1008, reason="lan-only")
             return
         if self.pending.get(peer, 0) >= MAX_PENDING_PER_IP:
             await ws.close(code=1013, reason="busy")
             return
+        # The slot is held until the hello is accepted or the refusal has finished,
+        # so a stream of bad hellos is capped the same as a stream of silent ones.
         self.pending[peer] = self.pending.get(peer, 0) + 1
         try:
-            raw = await asyncio.wait_for(ws.recv(), 5)
-            hello = loads(raw)
-        except Exception:
-            hello = None
+            relay_id = await self._hello(ws)
         finally:
             self.pending[peer] -= 1
             if self.pending[peer] <= 0:
                 self.pending.pop(peer, None)
-        if hello is None:
-            await ws.close(code=1008, reason="hello-timeout")
-            return
-        if hello.get("type") != "hello" or hello.get("v") != 1 or not tokens_equal(
-            hello.get("token"), self.token
-        ):
-            await self._refuse(ws, "unauthorized")
-            return
-        try:
-            relay_id = check_name(hello.get("host"), "host")
-        except ProtocolError as exc:
-            await self._refuse(ws, exc.code)
+        if relay_id is None:
             return
         old = self.conns.get(relay_id)
         self.conns[relay_id] = ws
@@ -125,6 +113,25 @@ class Broker:
                 self._drop(relay_id)
                 self.conns.pop(relay_id, None)
                 log.info("relay %s disconnected", relay_id)
+
+    async def _hello(self, ws) -> str | None:
+        """Read and check the hello. Returns the relay id, or None after closing the socket."""
+        try:
+            raw = await asyncio.wait_for(ws.recv(), 5)
+            hello = loads(raw)
+        except Exception:
+            await ws.close(code=1008, reason="hello-timeout")
+            return None
+        if hello.get("type") != "hello" or hello.get("v") != 1 or not tokens_equal(
+            hello.get("token"), self.token
+        ):
+            await self._refuse(ws, "unauthorized")
+            return None
+        try:
+            return check_name(hello.get("host"), "host")
+        except ProtocolError as exc:
+            await self._refuse(ws, exc.code)
+            return None
 
     async def _refuse(self, ws, code: str) -> None:
         try:
@@ -160,8 +167,11 @@ class Broker:
             await self._send(ws, relay_id, msg)
         elif kind == "ack":
             mid = str(msg.get("id") or "")
-            if self._owns_message(relay_id, mid):
+            row = self.store.get_message(mid) if mid else None
+            if row is not None and self.owner.get(row["recipient"]) == relay_id:
                 self.store.ack(mid)
+                # The next message for that name goes out now, not on the next pull.
+                await self._flush(ws, row["recipient"])
         elif kind == "nack":
             mid = str(msg.get("id") or "")
             if self._owns_message(relay_id, mid):
@@ -212,35 +222,23 @@ class Broker:
         self.store.requeue_name(name)
         self.store.set_online(name, False)
 
-    async def _flush(self, ws, name: str) -> None:
-        """Claim each due row before it goes out, so no row is sent twice."""
-        for row in self.store.queued(name):
-            if not self.store.claim(row["id"]):
-                continue
-            try:
-                await ws.send(dumps(_deliver_frame(row)))
-            except Exception:
-                self.store.requeue_id(row["id"])
-                raise
+    async def _flush(self, ws, name: str) -> bool:
+        """Send the head of `name`'s queue if nothing is in flight and it is due.
 
-    async def _push(self, row: dict) -> bool:
-        """Hand a queued row to its recipient now, if that keeps the order. True when in flight.
-
-        A row goes out ahead of the pull cycle only when it is due and no older row for
-        the same recipient is still queued; otherwise it waits for the flush, which sends
-        in acceptance order.
+        One message per name is out at a time; `claim` makes it a single winner. The
+        next one goes when the ack for this one arrives. Returns True when a frame
+        went out.
         """
-        dest = self.conns.get(self.owner.get(row["recipient"], ""))
-        if dest is None or not self.store.pushable(row):
+        head = self.store.head(name)
+        if head is None or not self.store.due(head):
             return False
-        if not self.store.claim(row["id"]):
-            return True
+        if not self.store.claim(head["id"]):
+            return False
         try:
-            await dest.send(dumps(_deliver_frame(row)))
+            await ws.send(dumps(_deliver_frame(head)))
         except Exception:
-            log.warning("push to %s failed", row["recipient"])
-            self.store.requeue_id(row["id"])
-            return False
+            self.store.requeue_id(head["id"])
+            raise
         return True
 
     async def _send(self, ws, relay_id: str, msg: dict) -> None:
@@ -273,9 +271,14 @@ class Broker:
         if existing["state"] == "failed":
             await ws.send(dumps({"type": "error", "id": mid, "error": "delivery-failed"}))
             return
-        waiting = existing["state"] == "queued"
-        if waiting:
-            waiting = not await self._push(existing)
+        dest = self.conns.get(self.owner.get(recipient, ""))
+        if dest is not None and existing["state"] == "queued":
+            try:
+                await self._flush(dest, recipient)
+            except Exception:
+                log.warning("push to %s failed", recipient)
+        current = self.store.get_message(mid)
+        waiting = current is not None and current["state"] == "queued"
         await ws.send(
             dumps({"type": "accepted", "id": mid, "to": recipient, "waiting": waiting})
         )

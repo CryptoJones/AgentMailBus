@@ -70,6 +70,10 @@ def check_text(value: object) -> str:
         raise ProtocolError("empty-text")
     if len(value) > MAX_TEXT:
         raise ProtocolError("too-large")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ProtocolError("bad-text") from exc
     return value
 
 

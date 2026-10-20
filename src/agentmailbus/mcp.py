@@ -12,18 +12,20 @@ import sys
 import uuid
 
 from agentmailbus import __version__
-from agentmailbus.protocol import MAX_FRAME, ProtocolError, check_id, check_name, check_priority, check_text
+from agentmailbus.protocol import ProtocolError, check_id, check_name, check_priority, check_text
 
 log = logging.getLogger("agentmailbus.mcp")
 
 SUPPORTED_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+# A 32,000-character text escaped as \uXXXX pairs is under 400 KB; this leaves room.
+MAX_LINE = 1024 * 1024
 
 SEND_TOOL = {
     "name": "send",
     "description": (
         "Send a message to a named agent. The relay delivers it. "
         "You do not receive messages with a tool. "
-        "If a call fails with an id in the error, retry with that id so the message is not sent twice."
+        "Every failure names the message id it used; retry with that id so the message is not sent twice."
     ),
     "inputSchema": {
         "type": "object",
@@ -44,6 +46,13 @@ SEND_TOOL = {
         "additionalProperties": False,
     },
 }
+
+
+class _Eof:
+    pass
+
+
+EOF = _Eof()
 
 
 def handle_request(msg: dict, sender: str, rpc) -> dict | None:
@@ -92,6 +101,7 @@ def _call(mid, params: dict, sender: str, rpc) -> dict:
         msg_id = check_id(args["id"]) if args.get("id") else str(uuid.uuid4())
     except ProtocolError as exc:
         return _tool_error(mid, exc.code)
+    # From here on the id exists, and every failure names it so a retry is the same message.
     payload = {
         "op": "send",
         "id": msg_id,
@@ -105,12 +115,10 @@ def _call(mid, params: dict, sender: str, rpc) -> dict:
     except (OSError, ProtocolError, ValueError) as exc:
         # The relay is down or restarting. The tool fails; the server stays up.
         log.warning("relay call failed: %s", type(exc).__name__)
-        return _tool_error(mid, f"relay-down (retry with id {msg_id})")
+        return _tool_error(mid, _named("relay-down", msg_id))
     if not isinstance(result, dict) or not result.get("ok"):
-        code = str((result or {}).get("error") or "send-failed") if isinstance(result, dict) else "send-failed"
-        if code in {"timeout", "broker-down"}:
-            code = f"{code} (retry with id {msg_id})"
-        return _tool_error(mid, code)
+        code = str(result.get("error") or "send-failed") if isinstance(result, dict) else "send-failed"
+        return _tool_error(mid, _named(code, msg_id))
     state = "queued" if result.get("waiting") else "accepted"
     return {
         "jsonrpc": "2.0",
@@ -119,6 +127,10 @@ def _call(mid, params: dict, sender: str, rpc) -> dict:
             "content": [{"type": "text", "text": f"{result.get('id', msg_id)} {state}"}],
         },
     }
+
+
+def _named(code: str, msg_id: str) -> str:
+    return f"{code} (message id {msg_id}; retry with this id)"
 
 
 def _tool_error(mid, code: str) -> dict:
@@ -134,23 +146,27 @@ def _rpc_error(mid, code: int, message: str) -> dict:
 
 
 def read_message(stream):
-    """One JSON value per line, at most MAX_FRAME bytes. None at end of input.
+    """One JSON value per line, at most MAX_LINE bytes. EOF at end of input.
 
     Raises ValueError (including JSONDecodeError) for a bad line; the over-long
-    remainder of such a line is discarded first so the stream stays in sync.
+    remainder of such a line is discarded first so the stream stays in sync. A
+    line holding JSON `null` is returned as None, which is a value, not the end.
     """
     while True:
-        line = stream.readline(MAX_FRAME + 1)
+        line = stream.readline(MAX_LINE + 2)
         if line == b"":
-            return None
-        if len(line) > MAX_FRAME:
+            return EOF
+        if len(line) > MAX_LINE + 1 or (len(line) == MAX_LINE + 1 and not line.endswith(b"\n")):
             while line and not line.endswith(b"\n"):
-                line = stream.readline(MAX_FRAME + 1)
+                line = stream.readline(MAX_LINE + 2)
             raise ValueError("too-large")
         line = line.strip()
         if not line:
             continue
-        return json.loads(line)
+        try:
+            return json.loads(line)
+        except RecursionError as exc:
+            raise ValueError("too-deep") from exc
 
 
 def write_message(stream, obj) -> None:
@@ -165,12 +181,16 @@ def serve_stdio(sender: str, rpc, stdin=None, stdout=None) -> None:
         try:
             msg = read_message(stdin)
         except ValueError as exc:
+            # The id cannot be known without parsing the line, so this reply carries null.
             code, text = (-32600, "request too large") if str(exc) == "too-large" else (-32700, "parse error")
             write_message(stdout, _rpc_error(None, code, text))
             continue
-        if msg is None:
+        if msg is EOF:
             break
         if isinstance(msg, list):
+            if not msg:
+                write_message(stdout, _rpc_error(None, -32600, "empty batch"))
+                continue
             replies = [r for r in (_handle(m, sender, rpc) for m in msg) if r is not None]
             if replies:
                 write_message(stdout, replies)

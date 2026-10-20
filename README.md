@@ -30,7 +30,7 @@ The relay registers each live session and delivers on the machine:
 | dsh | One JSON line on the inbox socket named in the binding. Confirm that frame on a live dsh before relying on it. |
 | grok, orca | One JSON line appended to the wake file. A Grok session watches that file. There is no receive tool. |
 
-None of these sockets answer, so "delivered" means the bytes were written. PROTOCOL.md spells out what an ack does and does not promise. A delivery that fails is retried with backoff and given up after 20 attempts; `agentmailbus who` shows what is still pending and how many messages were given up on. A fresh message never overtakes an older one for the same recipient, so one message that keeps failing holds the ones behind it until it succeeds or is given up on.
+None of these sockets answer, so "delivered" means the bytes were written. PROTOCOL.md spells out what an ack does and does not promise. A delivery that fails is retried with backoff and given up after 20 attempts; `agentmailbus who` shows what is still pending and how many messages were given up on. One message is in flight per name at a time and the next goes out on its ack, so a fresh message never overtakes an older one for the same recipient; one that keeps failing holds the ones behind it until it succeeds or is given up on.
 
 The broker database is the queue, not an archive: finished rows are deleted after 7 days. With `omi = true` in the relay config, each delivered message is also filed with `omind note`. That is off by default, because it writes whatever any token holder sent into the vault.
 

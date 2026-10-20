@@ -158,19 +158,24 @@ class BrokerStore:
         row = self.conn.execute("SELECT rowid, * FROM messages WHERE id=?", (mid,)).fetchone()
         return None if row is None else dict(row)
 
-    def pushable(self, row: dict) -> bool:
-        """A row may jump the pull cycle only when it is due and nothing older is still queued."""
-        if row["not_before"] > _now():
-            return False
-        older = self.conn.execute(
+    def head(self, name: str) -> dict | None:
+        """The oldest unfinished row for `name`: the only one that may go out next.
+
+        One message is in flight per name at a time, so order is acceptance order
+        even across failures. A `delivered` head means wait for its ack or nack.
+        """
+        row = self.conn.execute(
             """
-            SELECT 1 FROM messages
-            WHERE recipient=? AND state='queued' AND rowid < ?
-            LIMIT 1
+            SELECT rowid, * FROM messages
+            WHERE recipient=? AND state IN ('queued', 'delivered')
+            ORDER BY rowid LIMIT 1
             """,
-            (row["recipient"], row["rowid"]),
+            (name,),
         ).fetchone()
-        return older is None
+        return None if row is None else dict(row)
+
+    def due(self, row: dict) -> bool:
+        return row["state"] == "queued" and row["not_before"] <= _now()
 
     def claim(self, mid: str) -> bool:
         """Move one queued row to delivered. False when another path already took it."""
