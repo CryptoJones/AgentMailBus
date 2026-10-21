@@ -26,7 +26,7 @@ The relay registers each live session and delivers on the machine:
 
 | Harness | Delivery |
 | --- | --- |
-| claude | cc-socks. Auth line, then a user line. The peer token is read from `~/.claude/sessions/`. |
+| claude | cc-socks. Auth line, then a user line. The peer token is read from the session's sessions directory (`~/.claude/sessions/`, or under `CLAUDE_CONFIG_DIR`). |
 | dsh | One JSON line on the inbox socket named in the binding. Confirm that frame on a live dsh before relying on it. |
 | grok, orca | One JSON line appended to the wake file. A Grok session watches that file. There is no receive tool. |
 
@@ -36,7 +36,7 @@ The broker database is the queue, not an archive: finished rows are deleted afte
 
 ## MCP
 
-`agentmailbus mcp` speaks stdio MCP and exposes one tool, `send(to, text, priority)`. The sender name comes from `--from`. The model cannot supply a different sender through the tool. Any process running as the same user can, through the relay socket or `agentmailbus send`.
+`agentmailbus mcp` speaks stdio MCP and exposes one tool, `send(to, text, priority, id)`. The sender name comes from `--from`, or for Claude from the session itself (see below); a Claude session that stays off the bus gets no tools. The model cannot supply a different sender through the tool. Any process running as the same user can, through the relay socket or `agentmailbus send`.
 
 Receiving is not a tool. Claude is injected through cc-socks. dsh is injected through its inbox socket. Grok is injected by a new line on the wake file.
 
@@ -89,9 +89,32 @@ A Claude session:
 agentmailbus mcp --from rea-63 --harness claude
 ```
 
-`--pid` defaults to the parent process. Pass it when the parent is not the `claude` process that owns `/tmp/cc-socks/<pid>.sock`.
+`--pid` defaults to the parent process. Pass it when the parent is not the `claude` process that owns the session's cc-socks socket (`$XDG_RUNTIME_DIR/cc-socks/<pid>.sock`, or under the temporary directory).
 
-The name is per session, not per project. Two Claude sessions started from the same MCP config would both claim `rea-63`; the later one takes the name and the earlier one's sends go out under it. Give each session its own name, for example through a per-session MCP config or a wrapper that fills in `--from`.
+The name is per session, not per project. Two Claude sessions started from the same MCP config with `--from rea-63` would both claim `rea-63`; the later one takes the name and the earlier one's sends go out under it.
+
+For Claude, leave `--from` out and register the server once per host at user scope. Every new interactive Claude session on the host then joins the bus under a name of its own:
+
+```bash
+claude mcp add -s user agentmailbus -- ~/.local/share/agentmailbus/venv/bin/agentmailbus mcp --harness claude
+```
+
+The name is picked in this order:
+
+1. `AGENTMAILBUS_NAME`, when it is set and not empty: `AGENTMAILBUS_NAME=rea-63 claude`. It must already be a valid name; a bad one stops the server with `bad-name`. Every process the session starts inherits the variable, so when another live session on this host already holds that name, it is not taken and the next rule applies.
+2. The name Claude Code gives the session, a dash, the first eight characters of its session id, a dot, and the relay's host, for example `rea-4b-54e558bf.ronin28`. Claude Code's own names repeat (a folder name and two hex digits), and the broker keeps mail for any name it has seen, so the session id keeps a new session from receiving an old one's mail. Eight hex digits make that very unlikely, not impossible. A resumed session has the same id, and so the same name unless the session was renamed.
+
+The host is the one the relay announces: `host` in `~/.config/agentmailbus/relay.toml` (`--relay-config` to read another file), or the short host name when that is unset or the file cannot be read. So two hosts with a session of the same name do not collide (unless their host names agree in the first 50 or so characters); the broker refuses a name another relay holds online. On one host, the name is chosen and saved under a lock (on a filesystem that cannot lock, without one). Characters a name cannot hold become `-`, leading `.`, `_` and `-` are dropped, and the result is cut to 64 characters: the Claude name is cut first, then a long host (over about 50 characters), and the session id is always kept. A name another live session on this host already holds gets the pid added, then a counter.
+
+Each session's `send` tool starts with "Your name on the bus is …", so the agent can tell others where to reply. The name is taken when the session starts and does not follow a later rename. Since an automatic name is new for every session id, give an agent that others write to regularly a fixed name with `AGENTMAILBUS_NAME`.
+
+Only an interactive session joins. Claude Code writes a record for each session in `~/.claude/sessions/<pid>.json` (under `CLAUDE_CONFIG_DIR` when that is set); the server waits up to three seconds for it, and when there is none, or it says the session was started by a script (`claude -p` and the Agent SDK record an `sdk-…` entrypoint), the server answers with no tools and binds no name, and logs why. That holds even when `AGENTMAILBUS_NAME` is set, since a script inherits it from the session that started it. Claude Code records `sdk-cli` for a `claude -p` started from a terminal session; one started from inside an IDE or desktop session keeps that session's entrypoint, and so joins. A script that should be on the bus passes `--from` in its own MCP config. `--from` always wins and skips all of these checks.
+
+`AGENTMAILBUS_NAME` applies only to Claude; the other harnesses take `--from`.
+
+The server removes its binding when it exits, on SIGTERM and SIGHUP too. A binding left by a session that was killed is removed the next time an automatically named Claude session on the host starts. On Linux, an automatic binding (and a session record) whose pid now belongs to another process counts as dead. If an older config also starts `agentmailbus mcp --from …` for the same sessions, remove it, or each session joins twice under two names; one registered at user scope under the same name has to be removed first (`claude mcp remove -s user agentmailbus`).
+
+Claude Code starts MCP servers as its direct children, and the server takes its parent pid as the session. Register the command itself, not a shell or launcher that stays in between.
 
 A Grok session:
 
@@ -124,4 +147,4 @@ Python 3.12 or newer. The only runtime dependency is `websockets`.
 
 ## Not claimed yet
 
-The dsh line format is this project's contract, not a captured dsh trace. Orca does not yet have a confirmed push socket, so Grok and Orca share the wake file. There is no `wss://` and no per-host identity; see PROTOCOL.md. Fleet install is still ahead: the broker unit on pluto, a relay on each host, and the token on each host.
+The dsh line format is this project's contract, not a captured dsh trace. Orca does not yet have a confirmed push socket, so Grok and Orca share the wake file. There is no `wss://` and no per-host identity; see PROTOCOL.md.

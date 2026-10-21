@@ -45,6 +45,26 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def started_elsewhen(pid: int, start: object) -> bool:
+    """True when `start`, a process start time in clock ticks, is not when process
+    `pid` started: the pid now belongs to another process. Linux only; elsewhere,
+    or with no readable start time to compare, it is False."""
+    if start is None:
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, ValueError):
+        return False
+    fields = stat[stat.rfind(")") + 2 :].split()
+    # fields[0] is field 3 (state), so field 22, the start time, is fields[19].
+    if len(fields) <= 19:
+        return False
+    try:
+        return int(fields[19]) != int(str(start))
+    except ValueError:
+        return False  # a start time that cannot be read says nothing either way
+
+
 def save_binding(directory: Path, binding: dict) -> Path:
     """Write the session file. `binding` is updated in place (the pid as an int, a
     Grok or Orca wake path expanded), so keep that same dict for `remove_binding`."""
@@ -61,7 +81,8 @@ def save_binding(directory: Path, binding: dict) -> Path:
     binding["pid"] = int(binding.get("pid") or 0)
     private_dir(directory)
     path = directory / f"{name}.json"
-    tmp = path.with_suffix(".json.tmp")
+    # Per process, so two sessions saving at once never share a temporary file.
+    tmp = path.with_name(f".{name}.json.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(binding, indent=2) + "\n")
     os.chmod(tmp, 0o600)
     tmp.replace(path)
@@ -75,6 +96,9 @@ def remove_binding(path: Path, binding: dict) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(current, dict) or not same_binding(current, binding):
+        return False
+    if current.get("server") != binding.get("server"):
+        # Same session, but a newer server process wrote it.
         return False
     path.unlink(missing_ok=True)
     return True
@@ -90,7 +114,7 @@ def is_live(binding: dict) -> bool:
         if harness not in HARNESSES:
             return False
         pid = int(binding.get("pid") or 0)
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         return False
     if harness in {"grok", "orca"}:
         wake = binding.get("wake")
@@ -108,13 +132,13 @@ def is_live(binding: dict) -> bool:
             return False
         return True
     if harness == "claude":
-        if not pid_alive(pid):
+        if not pid_alive(pid) or started_elsewhen(pid, binding.get("proc_start")):
             return False
         sock = binding.get("socket") or claude_socket(pid)
-        return bool(sock) and os.path.exists(sock)
+        return isinstance(sock, str) and bool(sock) and os.path.exists(sock)
     if harness == "dsh":
         sock = binding.get("socket") or ""
-        if not sock or not os.path.exists(sock):
+        if not isinstance(sock, str) or not sock or not os.path.exists(sock):
             return False
         if pid and not pid_alive(pid):
             return False

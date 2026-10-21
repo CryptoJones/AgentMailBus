@@ -56,7 +56,7 @@ class _Eof:
 EOF = _Eof()
 
 
-def handle_request(msg: dict, sender: str, rpc) -> dict | None:
+def handle_request(msg: dict, sender: str | None, rpc) -> dict | None:
     mid = msg.get("id")
     if mid is None:
         return None
@@ -79,7 +79,8 @@ def handle_request(msg: dict, sender: str, rpc) -> dict | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": [SEND_TOOL]}}
+        tools = [_named_tool(SEND_TOOL, sender)] if sender is not None else []
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}}
     if method == "tools/call":
         return _call(mid, params, sender, rpc)
     return {
@@ -89,8 +90,14 @@ def handle_request(msg: dict, sender: str, rpc) -> dict | None:
     }
 
 
-def _call(mid, params: dict, sender: str, rpc) -> dict:
-    if params.get("name") != "send":
+def _named_tool(tool: dict, sender: str) -> dict:
+    """The tool as this session sees it: it says the session's own name, so the
+    model can tell another agent where to reply."""
+    return {**tool, "description": f"Your name on the bus is {sender}. " + tool["description"]}
+
+
+def _call(mid, params: dict, sender: str | None, rpc) -> dict:
+    if sender is None or params.get("name") != "send":
         return _tool_error(mid, "unknown-tool")
     args = params.get("arguments")
     if not isinstance(args, dict):
@@ -196,7 +203,7 @@ def write_message(stream, obj) -> None:
     stream.flush()
 
 
-def serve_stdio(sender: str, rpc, stdin=None, stdout=None) -> None:
+def serve_stdio(sender: str | None, rpc, stdin=None, stdout=None) -> None:
     stdin = sys.stdin.buffer if stdin is None else stdin
     stdout = sys.stdout.buffer if stdout is None else stdout
     while True:
@@ -222,7 +229,7 @@ def serve_stdio(sender: str, rpc, stdin=None, stdout=None) -> None:
             write_message(stdout, reply)
 
 
-def _handle(msg, sender: str, rpc) -> dict | None:
+def _handle(msg, sender: str | None, rpc) -> dict | None:
     if not isinstance(msg, dict):
         return _rpc_error(None, -32600, "invalid request")
     try:

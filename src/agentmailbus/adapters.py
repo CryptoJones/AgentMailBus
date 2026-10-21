@@ -26,7 +26,8 @@ from agentmailbus.paths import private_dir
 
 # Claude Code listens on this socket. The frame matches the protocol verified
 # 2026-10-03: an auth line, then a user line. The peer token file is
-# ~/.claude/sessions/<pid>.<sha256 of the socket path>.key
+# <sessions dir>/<pid>.<sha256 of the socket path>.key, where the sessions dir is
+# the binding's `sessions_dir`, or ~/.claude/sessions.
 
 log = logging.getLogger("agentmailbus.adapters")
 
@@ -58,9 +59,12 @@ def claude_socket(pid: int) -> str:
     return candidates[0]
 
 
-def peer_token(sock_path: str, pid: int) -> str | None:
+def peer_token(sock_path: str, pid: int, sessions_dir: object = None) -> str | None:
+    """The session's peer token. `sessions_dir` is where the session keeps its
+    records, when its binding says (CLAUDE_CONFIG_DIR moves it); else ~/.claude."""
     digest = hashlib.sha256(sock_path.encode()).hexdigest()
-    path = Path.home() / ".claude" / "sessions" / f"{pid}.{digest}.key"
+    base = Path(sessions_dir) if isinstance(sessions_dir, str) and os.path.isabs(sessions_dir) else Path.home() / ".claude" / "sessions"
+    path = base / f"{pid}.{digest}.key"
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -95,7 +99,7 @@ def claude_frames(binding: dict, message: dict) -> list[bytes]:
         "msg_id": message["id"],
     }
     frames = []
-    token = peer_token(sock_path, int(binding["pid"]))
+    token = peer_token(sock_path, int(binding["pid"]), binding.get("sessions_dir"))
     if token:
         frames.append(_line({"type": "auth", "token": token}))
     frames.append(_line(user))
