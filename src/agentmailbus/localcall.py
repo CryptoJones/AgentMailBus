@@ -8,7 +8,8 @@ from pathlib import Path
 from agentmailbus.protocol import dumps, loads
 
 
-def local_rpc(path: Path, payload: dict, timeout: float = 20) -> dict:
+def local_rpc(path: Path, payload: dict, timeout: float = 30) -> dict:
+    """One request on the relay socket. The timeout covers a 5 s register plus a 15 s send."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         sock.connect(str(path))
