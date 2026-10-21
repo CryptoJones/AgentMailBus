@@ -19,6 +19,7 @@ from agentmailbus.mcp import serve_stdio
 from agentmailbus.net import DEFAULT_ALLOW, load_secret, parse_allow
 from agentmailbus.omi import OmiMirror
 from agentmailbus.paths import data_dir
+from agentmailbus.adapters import wake_problem
 from agentmailbus.protocol import ProtocolError, check_harness, check_name
 from agentmailbus.registry import remove_binding, save_binding
 from agentmailbus.relay import Relay
@@ -126,6 +127,21 @@ def _default_pid(harness: str, pid: int | None) -> int:
     return 0
 
 
+def _wake_arg(text: str, harness: str) -> str:
+    """The wake path as the session means it: expanded and absolute in the caller's
+    directory, since the relay runs somewhere else. Only Grok and Orca read it."""
+    if harness not in {"grok", "orca"} or not text:
+        return text
+    problem = wake_problem(text) if text.startswith("~") else ""
+    if problem:  # judged as typed, before `~` is expanded into an ordinary path
+        raise ProtocolError("bad-wake", f"the wake path {problem}")
+    try:
+        path = Path(text).expanduser() if text.startswith("~") else Path(text)
+        return str(path.absolute())
+    except (RuntimeError, OSError) as exc:
+        raise ProtocolError("bad-wake", f"the wake path cannot be made absolute: {exc}") from None
+
+
 def _mcp(args) -> None:
     sender = check_name(args.sender, "from")
     harness = check_harness(args.harness)
@@ -133,7 +149,7 @@ def _mcp(args) -> None:
         "name": sender,
         "harness": harness,
         "pid": _default_pid(harness, args.pid),
-        "wake": args.wake,
+        "wake": _wake_arg(args.wake, harness),
         "socket": args.socket,
     }
     path = save_binding(_registry(args.registry), binding)
@@ -175,7 +191,7 @@ def _bind(args) -> None:
         "name": check_name(args.name),
         "harness": harness,
         "pid": pid or 0,
-        "wake": args.wake,
+        "wake": _wake_arg(args.wake, harness),
         "socket": args.socket,
     }
     path = save_binding(_registry(args.registry), binding)

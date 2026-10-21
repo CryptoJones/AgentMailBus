@@ -3,14 +3,32 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
-from agentmailbus.adapters import claude_socket
+from agentmailbus.adapters import claude_socket, expand_wake, wake_problem
 from agentmailbus.paths import private_dir
-from agentmailbus.protocol import HARNESSES, check_harness, check_name
+from agentmailbus.protocol import HARNESSES, ProtocolError, check_harness, check_name
 
 BINDING_FIELDS = ("harness", "pid", "wake", "socket")
+
+log = logging.getLogger("agentmailbus.registry")
+_said: dict[str, None] = {}  # insertion-ordered: the oldest entry goes first
+_SAID_CAP = 1024
+
+
+def _say_once(key: str, message: str, *args: object) -> None:
+    """The liveness scan runs every second; a dead binding is reported once per
+    name and path. The table is bounded so a host with a thousand dead session
+    files cannot grow it without end; past the bound the oldest is forgotten and
+    would be reported again."""
+    if key in _said:
+        return
+    while len(_said) >= _SAID_CAP:
+        del _said[next(iter(_said))]
+    _said[key] = None
+    log.warning(message, *args)
 
 
 def pid_alive(pid: int) -> bool:
@@ -28,8 +46,18 @@ def pid_alive(pid: int) -> bool:
 
 
 def save_binding(directory: Path, binding: dict) -> Path:
+    """Write the session file. `binding` is updated in place (the pid as an int, a
+    Grok or Orca wake path expanded), so keep that same dict for `remove_binding`."""
     name = check_name(binding["name"])
-    check_harness(binding["harness"])
+    harness = check_harness(binding["harness"])
+    if harness in {"grok", "orca"}:
+        wake = binding.get("wake")
+        if wake is None or wake == "":
+            raise ProtocolError("bad-wake", "a Grok or Orca binding needs a wake path")
+        problem = wake_problem(wake)
+        if problem:
+            raise ProtocolError("bad-wake", f"the wake path {problem}")
+        binding["wake"] = expand_wake(wake)  # the file holds what the scan can judge
     binding["pid"] = int(binding.get("pid") or 0)
     private_dir(directory)
     path = directory / f"{name}.json"
@@ -65,7 +93,20 @@ def is_live(binding: dict) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
     if harness in {"grok", "orca"}:
-        return pid_alive(pid) and bool(binding.get("wake"))
+        wake = binding.get("wake")
+        if not pid_alive(pid):
+            return False
+        if not wake:
+            _say_once(f"{binding.get('name')}:", "session %s is not live: it has no wake path", binding.get("name"))
+            return False
+        # A wake path that can never be delivered to is refused at bind time; a
+        # file written by hand or by an older build that names one is not live.
+        # This runs on the relay's loop, so it judges the string and touches nothing.
+        problem = wake_problem(wake, live=True)
+        if problem:
+            _say_once(f"{binding.get('name')}:{wake}", "session %s is not live: its wake path %s %s", binding.get("name"), wake, problem)
+            return False
+        return True
     if harness == "claude":
         if not pid_alive(pid):
             return False

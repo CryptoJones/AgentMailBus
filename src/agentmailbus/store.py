@@ -92,12 +92,18 @@ class BrokerStore:
             self.conn.execute("ALTER TABLE messages ADD COLUMN not_before TEXT NOT NULL DEFAULT ''")
         if "finished_at" not in cols:
             self.conn.execute("ALTER TABLE messages ADD COLUMN finished_at TEXT NOT NULL DEFAULT ''")
-        if "delivered_at" not in cols:
-            self.conn.execute("ALTER TABLE messages ADD COLUMN delivered_at TEXT NOT NULL DEFAULT ''")
         # Rows from before the broker stamped time: date them now so they age normally
         # instead of being pruned on the first pass.
         now = _now()
         self.conn.execute("UPDATE messages SET created_at=? WHERE created_at=''", (now,))
+        if "delivered_at" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN delivered_at TEXT NOT NULL DEFAULT ''")
+        # Rows an older broker had handed out without stamping them get a stamp, so a
+        # late ack from the relay that wrote them still finishes them after the
+        # restart requeue. On a database this broker wrote, no row matches.
+        self.conn.execute(
+            "UPDATE messages SET delivered_at=created_at WHERE delivered_at='' AND (state='delivered' OR attempts>0)"
+        )
         self.conn.execute(
             "UPDATE messages SET finished_at=? WHERE finished_at='' AND state IN ('acked', 'failed')",
             (now,),

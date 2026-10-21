@@ -345,9 +345,11 @@ class Relay:
         try:
             ok = await self._in_thread(fn, binding, msg)
         except Exception as exc:
-            log.warning("delivery failed for %s: %s", mid, type(exc).__name__)
-            ok = False
+            log.warning("delivery of %s to %s raised %s; handing it back", mid, to, type(exc).__name__)
+            await self._nack(mid)
+            return
         if not ok:
+            log.warning("delivery of %s to %s failed; handing it back", mid, to)
             await self._nack(mid)
             return
         # The bytes are in the session. From here on nothing may turn into a nack,

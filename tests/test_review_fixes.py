@@ -18,6 +18,7 @@ import agentmailbus.relay as relay_module
 from agentmailbus.adapters import deliver_wake, escape_text
 from agentmailbus.broker import MAX_PENDING_PER_IP, Broker
 from agentmailbus.cli import _run_relay
+from agentmailbus.cli import main as cli_main
 from agentmailbus.mcp import serve_stdio
 from agentmailbus.net import parse_allow
 from agentmailbus.paths import private_dir
@@ -366,8 +367,10 @@ def test_existing_directories_keep_their_mode(tmp_path: Path) -> None:
     assert (wake.stat().st_mode & 0o777) == 0o644
 
 
-def test_wake_file_is_private_whatever_the_umask(tmp_path: Path) -> None:
+def test_wake_file_is_private_whatever_the_umask(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    # The link route must do this on its own: the in-place route would mask a break in it.
+    monkeypatch.setattr(adapters, "_create_in_place", lambda path: pytest.fail("fell back to in-place creation"))
     old = os.umask(0o777)
     try:
         wake = tmp_path / "w.jsonl"
@@ -380,18 +383,25 @@ def test_wake_file_is_private_whatever_the_umask(tmp_path: Path) -> None:
         os.umask(old)
 
 
-def test_wake_file_must_be_a_regular_file(tmp_path: Path) -> None:
+def test_wake_file_must_be_a_regular_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
     fifo = tmp_path / "wake.fifo"
     os.mkfifo(fifo)
-    assert deliver_wake({"wake": str(fifo)}, msg) is False  # no reader: the open fails
-    # A device opens fine; the descriptor check is what refuses it.
-    assert deliver_wake({"wake": "/dev/null"}, msg) is False
-    # A symlink in the file's place is refused too.
     real = tmp_path / "real.jsonl"
     real.write_text("")
     link = tmp_path / "link.jsonl"
     link.symlink_to(real)
+    # The judge names each of them before anything is opened.
+    assert adapters.wake_problem(str(fifo)) == "is not a regular file"
+    assert adapters.wake_problem("/dev/null") == "is not a regular file"
+    assert adapters.wake_problem(str(link)) == "is a symlink"
+    # Even past the judge (a swap after it ran), the descriptor guards refuse them:
+    # the read-write, non-blocking open of a FIFO succeeds with no reader and the
+    # regular-file check on the descriptor refuses it; a device opens fine and is
+    # refused the same way; a symlink is refused by O_NOFOLLOW at the open.
+    monkeypatch.setattr(adapters, "wake_problem", lambda wake, live=False: "")
+    assert deliver_wake({"wake": str(fifo)}, msg) is False
+    assert deliver_wake({"wake": "/dev/null"}, msg) is False
     assert deliver_wake({"wake": str(link)}, msg) is False
     assert real.read_text() == ""
 
@@ -839,10 +849,37 @@ def test_wake_partial_write_is_taken_back_or_fenced(tmp_path: Path, monkeypatch:
     raw = wake.read_bytes()
     assert b'{"id":"n","text":"neighbour"}' in raw  # the other writer's bytes were not truncated away
     assert raw.startswith(clean)
-    assert raw.endswith(b"\n")  # fenced, so the retry starts a clean line
+    assert raw.endswith(b'"neighbour"}\n')  # the neighbour ended the line; no blank line was added
     assert deliver_wake({"wake": str(wake)}, msg)
     last = wake.read_bytes().split(b"\n")[-2]
     assert json.loads(last)["id"] == "m"
+
+    # The other writer landed a fragment of its own: the fence newline is needed,
+    # and it is the only thing written after the failure.
+    calls.clear()
+    fences = []
+
+    def half_then_torn_neighbour_then_fail(fd, data):
+        if not calls:
+            calls.append(1)
+            return real_write(fd, bytes(data)[: max(1, len(data) // 2)])
+        if len(data) == 1:
+            fences.append(bytes(data))
+            return real_write(fd, data)
+        with open(wake, "ab") as other:
+            other.write(b'{"id":"n2","te')
+        raise OSError(28, "no space")
+
+    before = wake.read_bytes()
+    monkeypatch.setattr(adapters.os, "write", half_then_torn_neighbour_then_fail)
+    assert deliver_wake({"wake": str(wake)}, msg) is False
+    monkeypatch.setattr(adapters.os, "write", real_write)
+    raw = wake.read_bytes()
+    assert fences == [b"\n"]
+    assert raw.startswith(before)
+    assert raw.endswith(b'{"id":"n2","te\n')
+    assert deliver_wake({"wake": str(wake)}, msg)
+    assert json.loads(wake.read_bytes().split(b"\n")[-2])["id"] == "m"
 
 
 def test_wake_writers_sharing_a_file_never_interleave(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -916,3 +953,833 @@ async def _idle(tmp_path: Path) -> None:
         await task
     finally:
         await broker.stop()
+
+
+def test_wake_lock_handed_out_is_not_pruned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lock looked up but not yet acquired must survive a prune, or two writers
+    end up holding different locks for one file."""
+    monkeypatch.setattr(adapters, "_wake_locks", {})
+    monkeypatch.setattr(adapters, "_WAKE_LOCKS_CAP", 4)
+    shared = tmp_path / "shared.jsonl"
+    entry = adapters._wake_entry(shared)  # handed out; the caller has not acquired it
+    assert not entry.lock.locked()
+    for i in range(10):  # ten fresh paths: the table passes the cap and prunes
+        with adapters._wake_lock(tmp_path / f"session-{i}.jsonl"):
+            pass
+    assert len(adapters._wake_locks) <= 5
+    assert adapters._wake_entry(shared) is entry  # a second writer gets the same lock
+    adapters._wake_release(entry)
+    adapters._wake_release(entry)
+    assert entry.refs == 0
+    for i in range(10):  # the next prune drops it: nobody references it any more
+        with adapters._wake_lock(tmp_path / f"later-{i}.jsonl"):
+            pass
+    assert os.path.realpath(shared) not in adapters._wake_locks
+
+
+def test_wake_writers_never_interleave_while_the_table_is_pruned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A smoke test under churn. The deterministic guard for the hand-out window is
+    test_wake_lock_handed_out_is_not_pruned above."""
+    monkeypatch.setattr(adapters, "_wake_locks", {})
+    monkeypatch.setattr(adapters, "_WAKE_LOCKS_CAP", 2)
+    wake = tmp_path / "shared.jsonl"
+    text = "x" * 20_000
+    real_write = os.write
+
+    def torn_write(fd, data):
+        data = bytes(data)
+        if len(data) <= 1:
+            return real_write(fd, data)
+        n = real_write(fd, data[: len(data) // 2])
+        import time as _t
+
+        _t.sleep(0.0005)
+        return n
+
+    monkeypatch.setattr(adapters.os, "write", torn_write)
+
+    def writer(name: str) -> None:
+        for i in range(20):
+            assert deliver_wake({"wake": str(wake)}, {"id": f"{name}-{i}", "from": name, "to": "z", "text": text})
+
+    def churn() -> None:  # a wrapper minting a path per session keeps the prune running
+        for i in range(200):
+            assert deliver_wake({"wake": str(tmp_path / f"s{i}.jsonl")}, {"id": f"c-{i}", "from": "c", "to": "z", "text": "t"})
+
+    failures: list[BaseException] = []
+
+    def run(fn, *args):
+        try:
+            fn(*args)
+        except BaseException as exc:  # a failed assertion in a thread must fail the test
+            failures.append(exc)
+
+    threads = [threading.Thread(target=run, args=(writer, n)) for n in ("grok", "orca", "third")]
+    threads.append(threading.Thread(target=run, args=(churn,)))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    monkeypatch.setattr(adapters.os, "write", real_write)
+    assert failures == []
+    assert sum(1 for i in range(200) if (tmp_path / f"s{i}.jsonl").exists()) == 200  # the churn ran
+    lines = wake.read_text().splitlines()
+    assert len(lines) == 60
+    assert all(json.loads(line)["text"] == text for line in lines)
+
+
+def test_wake_file_is_created_without_hard_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+
+    def no_links(src, dst, **kw):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(adapters.os, "link", no_links)
+    old = os.umask(0o277)  # would leave 0400: only the fchmod can produce 0600
+    try:
+        wake = tmp_path / "w.jsonl"
+        assert deliver_wake({"wake": str(wake)}, msg)
+        assert (wake.stat().st_mode & 0o777) == 0o600
+        assert json.loads(wake.read_text())["id"] == "m"
+        assert [n for n in os.listdir(tmp_path) if n.endswith(".tmp")] == []  # the temp is gone
+        # An existing file keeps its mode either way.
+        kept = tmp_path / "kept.jsonl"
+        kept.write_text("")
+        kept.chmod(0o640)
+        assert deliver_wake({"wake": str(kept)}, msg)
+        assert (kept.stat().st_mode & 0o777) == 0o640
+    finally:
+        os.umask(old)
+
+
+def test_wake_fallback_meets_a_file_another_relay_just_made(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    wake = tmp_path / "w.jsonl"
+
+    def other_relay_links_first(path):
+        path.write_text("")  # their file appears between the two routes
+        path.chmod(0o640)
+        return None
+
+    monkeypatch.setattr(adapters, "_link_in", other_relay_links_first)
+    assert deliver_wake({"wake": str(wake)}, {"id": "m", "from": "a", "to": "b", "text": "t"})
+    assert (wake.stat().st_mode & 0o777) == 0o640  # theirs, untouched by the in-place route
+    assert json.loads(wake.read_text())["id"] == "m"
+
+
+def test_wake_file_name_near_the_component_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 255 bytes: valid. A temp name derived from it would not be, so the temp name
+    # must not depend on the wake file's name; the in-place route may not cover for it.
+    monkeypatch.setattr(adapters, "_create_in_place", lambda path: pytest.fail("fell back to in-place creation"))
+    wake = tmp_path / ("w" * 249 + ".jsonl")
+    assert deliver_wake({"wake": str(wake)}, {"id": "m", "from": "a", "to": "b", "text": "t"})
+    assert json.loads(wake.read_text())["id"] == "m"
+    assert [n for n in os.listdir(tmp_path) if n.endswith(".tmp")] == []
+
+
+def test_wake_temp_that_cannot_be_made_falls_back_to_in_place(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_open = os.open
+
+    denied = []
+
+    def no_temps(path, flags, *args):
+        if ".amb-wake-" in str(path):
+            denied.append(path)
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(adapters.os, "open", no_temps)
+    wake = tmp_path / "w.jsonl"
+    old = os.umask(0o277)
+    try:
+        assert deliver_wake({"wake": str(wake)}, {"id": "m", "from": "a", "to": "b", "text": "t"})
+    finally:
+        os.umask(old)
+    assert denied  # the link route was tried and refused
+    assert (wake.stat().st_mode & 0o777) == 0o600
+    assert json.loads(wake.read_text())["id"] == "m"
+
+
+def test_wake_creation_survives_a_close_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_close, real_open = os.close, os.open
+    failed, temps = [], []
+
+    pending = set()  # temp descriptors open right now; numbers are reused after a close
+
+    def open_recording_temps(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        if ".amb-wake-" in str(path):
+            temps.append(fd)
+            pending.add(fd)
+        return fd
+
+    which = {"index": 0}  # which close of a temp descriptor (creation, then probe) fails
+    closes = []
+
+    def close_fails_on_chosen(fd):
+        real_close(fd)
+        if fd in pending:
+            pending.discard(fd)
+            closes.append(fd)
+            if len(closes) - 1 == which["index"]:
+                failed.append(fd)
+                raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(adapters.os, "open", open_recording_temps)
+    monkeypatch.setattr(adapters.os, "close", close_fails_on_chosen)
+    monkeypatch.setattr(adapters, "_create_in_place", lambda path: pytest.fail("fell back to in-place creation"))
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    for which["index"], wake in ((1, tmp_path / "probe.jsonl"), (0, tmp_path / "creation.jsonl")):
+        temps.clear()
+        closes.clear()
+        failed.clear()
+        assert deliver_wake({"wake": str(wake)}, msg)
+        assert len(temps) == 2 and len(closes) == 2 and failed == [closes[which["index"]]]  # the chosen close did fail
+        assert json.loads(wake.read_text())["id"] == "m"
+    assert [n for n in os.listdir(tmp_path) if n.endswith(".tmp")] == []
+
+
+not_root = pytest.mark.skipif(os.geteuid() == 0, reason="root can open a 0400 file read-write")
+
+
+@not_root
+def test_wake_file_whose_mode_cannot_be_set_is_not_left_unusable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_fchmod(fd, mode):
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(adapters, "_link_in", lambda path: None)  # only the in-place route
+    monkeypatch.setattr(adapters.os, "fchmod", no_fchmod)
+    wake = tmp_path / "w.jsonl"
+    old = os.umask(0o277)  # creation leaves 0400: a file the owner could never reopen read-write
+    try:
+        assert deliver_wake({"wake": str(wake)}, {"id": "m", "from": "a", "to": "b", "text": "t"}) is False
+        assert not wake.exists()  # removed, so the next attempt starts over
+    finally:
+        os.umask(old)
+    old = os.umask(0o077)  # the umask leaves 0600: the failed fchmod does not matter
+    try:
+        assert deliver_wake({"wake": str(wake)}, {"id": "m", "from": "a", "to": "b", "text": "t"})
+        assert (wake.stat().st_mode & 0o777) == 0o600
+    finally:
+        os.umask(old)
+
+
+@not_root
+def test_wake_file_the_link_route_cannot_make_usable_is_never_linked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_fchmod(fd, mode):
+        raise OSError(1, "Operation not permitted")
+
+    linked, fallen_back = [], []
+    monkeypatch.setattr(adapters.os, "link", lambda src, dst, **kw: linked.append(dst))
+    monkeypatch.setattr(adapters, "_create_in_place", lambda path: fallen_back.append(path) or None)
+    monkeypatch.setattr(adapters.os, "fchmod", no_fchmod)
+    wake = tmp_path / "w.jsonl"
+    old = os.umask(0o277)  # the temp is 0400: the proving reopen fails before the link
+    try:
+        assert deliver_wake({"wake": str(wake)}, {"id": "m", "from": "a", "to": "b", "text": "t"}) is False
+    finally:
+        os.umask(old)
+    assert linked == []  # never published
+    assert fallen_back == []  # and not made in place either: that would publish the same failure
+    assert not wake.exists()
+    assert [n for n in os.listdir(tmp_path) if n.endswith(".tmp")] == []
+
+
+def test_wake_file_on_a_filesystem_without_modes_is_kept_and_logged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    wake = tmp_path / "w.jsonl"
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+
+    def mount_refuses_and_gives_0644(fd, mode):
+        os.chmod(wake, 0o644)  # what a vfat mount with fmask would report
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(adapters, "_link_in", lambda path: None)
+    monkeypatch.setattr(adapters.os, "fchmod", mount_refuses_and_gives_0644)
+    with caplog.at_level("WARNING", logger="agentmailbus.adapters"):
+        assert deliver_wake({"wake": str(wake)}, msg)
+    assert (wake.stat().st_mode & 0o777) == 0o644  # kept: the relay can use it
+    assert any("stays mode 644" in r.getMessage() for r in caplog.records)
+
+    # A mount that accepts the change and ignores it (vfat with quiet, CIFS) is
+    # caught the same way, on the link route too.
+    caplog.clear()
+    monkeypatch.undo()
+    wake2 = tmp_path / "w2.jsonl"
+    real_fchmod = os.fchmod
+
+    def mount_ignores(fd, mode):
+        real_fchmod(fd, 0o644)  # pretends to obey, keeps its own
+
+    monkeypatch.setattr(adapters.os, "fchmod", mount_ignores)
+    monkeypatch.setattr(adapters, "_create_in_place", lambda path: pytest.fail("fell back to in-place creation"))
+    with caplog.at_level("WARNING", logger="agentmailbus.adapters"):
+        assert deliver_wake({"wake": str(wake2)}, msg)
+    assert (wake2.stat().st_mode & 0o777) == 0o644
+    assert any("stays mode 644" in r.getMessage() for r in caplog.records)
+
+
+@not_root
+def test_wake_file_removal_after_a_failed_reopen_is_guarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    wake = tmp_path / "w.jsonl"
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    real_fstat, real_fchmod = os.fstat, os.fchmod
+
+    def no_fchmod(fd, mode):
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(adapters, "_link_in", lambda path: None)
+    monkeypatch.setattr(adapters.os, "fchmod", no_fchmod)
+    old = os.umask(0o277)
+    try:
+        # The file cannot be identified: it is left alone and the reason is logged.
+        calls = []
+
+        def fstat_fails_once(fd):
+            if not calls:
+                calls.append(fd)
+                raise OSError(5, "Input/output error")
+            return real_fstat(fd)
+
+        monkeypatch.setattr(adapters.os, "fstat", fstat_fails_once)
+        with caplog.at_level("WARNING", logger="agentmailbus.adapters"):
+            assert deliver_wake({"wake": str(wake)}, msg) is False
+        assert wake.exists() and (wake.stat().st_mode & 0o777) == 0o400
+        assert any("cannot tell" in r.getMessage() for r in caplog.records)
+        monkeypatch.setattr(adapters.os, "fstat", real_fstat)
+        wake.chmod(0o600)  # fixed by hand, as the doc says
+        assert deliver_wake({"wake": str(wake)}, msg)
+        wake.unlink()
+        # The path was swapped for another file while the mode was being set: that
+        # file is not the one this relay made, so it is left alone even though the
+        # reopen failed on it.
+        other = tmp_path / "other.jsonl"
+
+        def fchmod_swaps(fd, mode):
+            other.write_bytes(b'{"id":"theirs"}\n')
+            other.chmod(0o400)
+            os.replace(other, wake)
+            raise OSError(1, "Operation not permitted")
+
+        caplog.clear()
+        monkeypatch.setattr(adapters.os, "fchmod", fchmod_swaps)
+        with caplog.at_level("WARNING", logger="agentmailbus.adapters"):
+            assert deliver_wake({"wake": str(wake)}, msg) is False
+        assert wake.read_bytes() == b'{"id":"theirs"}\n'
+        assert any("replaced" in r.getMessage() for r in caplog.records)
+        wake.unlink()
+        # The file is the one this relay made, but something landed in it before the
+        # reopen failed (another writer over a shared mount): data is never removed.
+        def fchmod_after_a_neighbour_wrote(fd, mode):
+            os.write(fd, b'{"id":"neighbour"}\n')
+            raise OSError(1, "Operation not permitted")
+
+        caplog.clear()
+        monkeypatch.setattr(adapters.os, "fchmod", fchmod_after_a_neighbour_wrote)
+        with caplog.at_level("WARNING", logger="agentmailbus.adapters"):
+            assert deliver_wake({"wake": str(wake)}, msg) is False
+        assert wake.read_bytes() == b'{"id":"neighbour"}\n'
+        assert any("has data" in r.getMessage() for r in caplog.records)
+        wake.unlink()
+        # Only a permission failure removes: another reason leaves the new file for
+        # the next attempt, which opens it.
+        monkeypatch.setattr(adapters.os, "fchmod", real_fchmod)
+        real_open = os.open
+        once = []
+
+        def final_reopen_emfile(path_, flags, *args):
+            if Path(path_) == wake and not (flags & os.O_CREAT) and wake.exists() and not once:
+                once.append(1)
+                raise OSError(24, "Too many open files")
+            return real_open(path_, flags, *args)
+
+        monkeypatch.setattr(adapters.os, "open", final_reopen_emfile)
+        assert deliver_wake({"wake": str(wake)}, msg) is False
+        assert wake.exists() and wake.stat().st_size == 0
+        assert deliver_wake({"wake": str(wake)}, msg)
+        monkeypatch.setattr(adapters.os, "open", real_open)
+    finally:
+        os.umask(old)
+
+
+@not_root
+def test_wake_file_nobody_could_write_is_removed_on_the_next_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """A 0400 file left by an attempt that failed for another reason is repaired at
+    the next first open; a 0200 file, which a same-user writer could have appended
+    to, is not."""
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    dead = tmp_path / "dead.jsonl"
+    dead.touch(mode=0o400)
+    assert deliver_wake({"wake": str(dead)}, msg)
+    assert (dead.stat().st_mode & 0o777) == 0o600 and json.loads(dead.read_text())["id"] == "m"
+    real_judge = adapters.wake_problem
+    for mode in (0o200, 0o020, 0o002):  # a write bit for anyone keeps the file
+        writable = tmp_path / f"writable-{mode:o}.jsonl"
+        writable.touch()
+        writable.chmod(mode)  # by chmod, not by creation mode, so the umask does not narrow it
+        assert (writable.stat().st_mode & 0o777) == mode
+        # The judge refuses it first, as a file the relay cannot read and write that
+        # it will not repair; past the judge, the removal rule itself leaves it too.
+        assert real_judge(str(writable)) == "cannot be read and written (EACCES)"
+        assert deliver_wake({"wake": str(writable)}, msg) is False
+        monkeypatch.setattr(adapters, "wake_problem", lambda wake, live=False: "")
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="agentmailbus.adapters"):
+            assert deliver_wake({"wake": str(writable)}, msg) is False
+        monkeypatch.setattr(adapters, "wake_problem", real_judge)
+        assert writable.exists() and (writable.stat().st_mode & 0o777) == mode
+        assert any("could have been written to" in r.getMessage() for r in caplog.records)
+    populated = tmp_path / "populated.jsonl"
+    populated.write_bytes(b'{"id":"old"}\n')
+    populated.chmod(0o400)
+    assert deliver_wake({"wake": str(populated)}, msg) is False
+    assert populated.read_bytes() == b'{"id":"old"}\n'
+    # The whole sequence: creation under a narrowing umask with the mode refused,
+    # then a reopen that fails for another reason, leaves a 0400 file; the next
+    # attempt's first open repairs it and delivers.
+    real_fchmod, real_open = os.fchmod, os.open
+    fchmod_calls, reopen_calls = [], []
+
+    def fchmod_fails_once(fd, mode):
+        if not fchmod_calls:
+            fchmod_calls.append(1)
+            raise OSError(1, "Operation not permitted")
+        return real_fchmod(fd, mode)
+
+    seq = tmp_path / "seq.jsonl"
+
+    def reopen_eio_once(path_, flags, *args):
+        if Path(path_) == seq and not (flags & os.O_CREAT) and seq.exists() and not reopen_calls:
+            reopen_calls.append(1)
+            raise OSError(5, "Input/output error")
+        return real_open(path_, flags, *args)
+
+    monkeypatch.setattr(adapters, "_link_in", lambda path: None)
+    monkeypatch.setattr(adapters.os, "fchmod", fchmod_fails_once)
+    monkeypatch.setattr(adapters.os, "open", reopen_eio_once)
+    old = os.umask(0o277)
+    try:
+        assert deliver_wake({"wake": str(seq)}, msg) is False
+        assert seq.exists() and (seq.stat().st_mode & 0o777) == 0o400  # left: not a permission failure
+        assert deliver_wake({"wake": str(seq)}, msg)  # repaired at the first open, made again, delivered
+    finally:
+        os.umask(old)
+    assert (seq.stat().st_mode & 0o777) == 0o600 and json.loads(seq.read_text())["id"] == "m"
+
+
+def test_wake_temps_left_by_a_dead_relay_are_swept(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    import subprocess
+
+    msg = {"id": "m", "from": "a", "to": "b", "text": "t"}
+    wake = tmp_path / "w.jsonl"
+    assert deliver_wake({"wake": str(wake)}, msg)
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    dead = proc.pid
+    assert not pid_alive(dead)
+    second_link = tmp_path / f".amb-wake-{dead}-0badf00d.tmp"  # killed after the link, before the unlink
+    os.link(wake, second_link)
+    empty = tmp_path / f".amb-wake-{dead}-00000001.tmp"  # killed before the link
+    empty.write_bytes(b"")
+    live = tmp_path / f".amb-wake-{os.getpid()}-0000beef.tmp"  # another relay mid-creation
+    live.write_bytes(b"")
+    unrelated = tmp_path / ".note.tmp"
+    unrelated.write_bytes(b"keep")
+    # A populated file with one link is somebody's data, whatever it is called.
+    data = tmp_path / ".amb-wake-0-deadbeef.tmp"
+    data.write_bytes(b'{"id":"old"}\n')
+    # A symlink in the pattern is not a regular file, whatever it points at: here an
+    # empty regular file, which a sweep that followed symlinks would take for a leftover.
+    target = tmp_path / "empty.jsonl"
+    target.write_bytes(b"")
+    alias = tmp_path / f".amb-wake-{dead}-0000a11a.tmp"
+    alias.symlink_to(target)
+    # Only the exact pattern: a trailing newline in the name is not a match.
+    odd = tmp_path / f".amb-wake-{dead}-00000003.tmp\n"
+    odd.write_bytes(b"")
+    assert deliver_wake({"wake": str(wake)}, msg)
+    assert not second_link.exists() and not empty.exists()
+    assert live.exists() and unrelated.exists() and data.read_bytes() == b'{"id":"old"}\n'
+    assert alias.is_symlink() and target.exists() and odd.exists()
+    # Unicode digits are not a pid: such a name is nobody's temp and is left alone,
+    # even when the digits spell the dead pid.
+    arabic = str(dead).translate(str.maketrans("0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"))
+    foreign = tmp_path / f".amb-wake-{arabic}-deadbeef.tmp"
+    foreign.write_bytes(b"")
+    assert wake.stat().st_nlink == 1
+    assert wake.read_text().count("\n") == 2
+    # The sweep is not once per process: a relay that dies later is cleaned up too.
+    later = tmp_path / f".amb-wake-{dead}-00000002.tmp"
+    later.write_bytes(b"")
+    assert deliver_wake({"wake": str(wake)}, msg)
+    assert not later.exists() and foreign.exists()
+    # A wake path named in the reserved pattern is refused, not written and not swept.
+    assert deliver_wake({"wake": str(data)}, {**msg, "id": "m2"}) is False
+    assert data.read_bytes() == b'{"id":"old"}\n'
+    fresh = tmp_path / ".amb-wake-0-0000f00d.tmp"
+    assert deliver_wake({"wake": str(fresh)}, {**msg, "id": "m3"}) is False
+    assert not fresh.exists()
+    # The refusal is the exact pattern too: the newline-suffixed name is an ordinary wake file.
+    assert deliver_wake({"wake": str(odd)}, {**msg, "id": "m4"})
+    assert json.loads(odd.read_text())["id"] == "m4"
+    # And a binding with such a wake path is refused before it is saved, by the
+    # library and by the command line; one written by hand is not live.
+    with pytest.raises(ProtocolError) as err:
+        save_binding(tmp_path / "reg", {"name": "grok-x", "harness": "grok", "pid": os.getpid(), "wake": str(fresh)})
+    assert err.value.code == "bad-wake"
+    assert not (tmp_path / "reg" / "grok-x.json").exists()
+    with pytest.raises(SystemExit) as exit_:
+        cli_main(["bind", "grok-x", "--harness", "grok", "--wake", str(fresh), "--registry", str(tmp_path / "reg")])
+    assert "bad-wake" in str(exit_.value)
+    assert not (tmp_path / "reg" / "grok-x.json").exists()
+    save_binding(tmp_path / "reg", {"name": "grok-y", "harness": "grok", "pid": os.getpid(), "wake": str(odd)})  # not reserved
+    (tmp_path / "reg").mkdir(exist_ok=True)
+    (tmp_path / "reg" / "grok-x.json").write_text(json.dumps({"name": "grok-x", "harness": "grok", "pid": os.getpid(), "wake": str(fresh)}))
+    # A ~user that does not resolve can never be delivered to: refused the same way.
+    with pytest.raises(ProtocolError) as err:
+        save_binding(tmp_path / "reg", {"name": "grok-z", "harness": "grok", "pid": os.getpid(), "wake": "~no-such-user-amb/in.jsonl"})
+    assert err.value.code == "bad-wake" and "expanded" in err.value.detail
+    (tmp_path / "reg" / "grok-z.json").write_text(json.dumps({"name": "grok-z", "harness": "grok", "pid": os.getpid(), "wake": "~no-such-user-amb/in.jsonl"}))
+    assert set(load_live(tmp_path / "reg")) == {"grok-y"}
+    assert deliver_wake({"wake": "~no-such-user-amb/in.jsonl"}, msg) is False
+    # The same judge refuses every path that could never be the session's file.
+    directory = tmp_path / "a-directory"
+    directory.mkdir()
+    afile = tmp_path / "a-file"
+    afile.write_text("")
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "nowhere")
+    leaf_link = tmp_path / "leaf-link.jsonl"
+    leaf_link.symlink_to(afile)
+    leaf_dangling = tmp_path / "leaf-dangling.jsonl"
+    leaf_dangling.symlink_to(tmp_path / "nowhere")
+    leaf_fifo = tmp_path / "leaf.fifo"
+    os.mkfifo(leaf_fifo)
+    unreadable = tmp_path / "unreadable.jsonl"
+    unreadable.write_bytes(b'{"id":"old"}\n')
+    unreadable.chmod(0o000)
+    hidden_dir = tmp_path / "no-search"
+    hidden_dir.mkdir()
+    hidden = hidden_dir / "in.jsonl"
+    hidden.write_bytes(b"")
+    hidden_dir.chmod(0o600)  # exists, but cannot be looked into
+    leaves = (str(leaf_link), str(leaf_dangling), str(leaf_fifo), "/dev/null") + (() if os.geteuid() == 0 else (str(unreadable), str(hidden)))
+    repairable = tmp_path / "repairable.jsonl"
+    repairable.touch()
+    repairable.chmod(0o400)  # empty, ours, nobody can write: the relay repairs it, so it is allowed
+    assert adapters.wake_problem(str(repairable)) == ""
+    locked_dir = tmp_path / "locked"
+    locked_dir.mkdir()
+    stuck = locked_dir / "stuck.jsonl"
+    stuck.touch()
+    stuck.chmod(0o400)
+    locked_dir.chmod(0o500)  # the repair (unlink and remake) and a new file both need a writable directory
+    if os.geteuid() != 0:
+        assert adapters.wake_problem(str(unreadable)) == "cannot be read and written (EACCES)"
+        assert adapters.wake_problem(str(hidden)).startswith("cannot be inspected")
+        assert adapters.wake_problem(str(stuck)) == f"cannot be made in {locked_dir} (EACCES)"
+        assert adapters.wake_problem(str(locked_dir / "new.jsonl")) == f"cannot be made in {locked_dir} (EACCES)"
+        assert adapters.wake_problem(str(locked_dir / "deeper" / "new.jsonl")) == f"cannot be made in {locked_dir} (EACCES)"
+        leaves += (str(stuck), str(locked_dir / "new.jsonl"))
+    # A passing error while inspecting (EIO, ESTALE) is not a reason to refuse, from
+    # any of the judge's questions: the path is let through with a warning and the
+    # delivery judges it again. A lasting answer from the same probe still refuses.
+    real_stat, real_open, real_access = os.stat, os.open, adapters._access
+    flaky = tmp_path / "flaky.jsonl"
+    flaky_calls: list[str] = []
+
+    def stat_eio_once(p, *a, **k):
+        if Path(p) in (flaky, flaky.parent) and k.get("follow_symlinks", True) is False and "leaf" not in flaky_calls:
+            flaky_calls.append("leaf")
+            raise OSError(5, "Input/output error")
+        if Path(p) == flaky.parent and k.get("follow_symlinks", True) and "dir" not in flaky_calls:
+            flaky_calls.append("dir")
+            raise OSError(116, "Stale file handle")
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(adapters.os, "stat", stat_eio_once)
+    assert adapters.wake_problem(str(flaky)) == "" and "leaf" in flaky_calls  # the leaf's lstat
+    assert adapters.wake_problem(str(flaky)) == "" and "dir" in flaky_calls  # the directory's stat
+    monkeypatch.setattr(adapters.os, "stat", real_stat)
+    existing = tmp_path / "existing.jsonl"
+    existing.write_bytes(b'{"id":"old"}\n')
+    monkeypatch.setattr(adapters, "_access", lambda p, m: False)  # access says no, without a reason
+
+    def open_eio(p, flags, *a):
+        if Path(p) == existing or (".amb-wake-" in str(p) and Path(p).parent == tmp_path):
+            raise OSError(5, "Input/output error")
+        return real_open(p, flags, *a)
+
+    monkeypatch.setattr(adapters.os, "open", open_eio)
+    assert adapters.wake_problem(str(existing)) == ""  # the open's reason was passing
+    assert adapters.wake_problem(str(tmp_path / "brand-new.jsonl")) == ""  # the create probe's too
+
+    def open_eacces(p, flags, *a):
+        if Path(p) == existing or (".amb-wake-" in str(p) and Path(p).parent == tmp_path):
+            raise PermissionError(13, "Permission denied")
+        return real_open(p, flags, *a)
+
+    monkeypatch.setattr(adapters.os, "open", open_eacces)
+    assert adapters.wake_problem(str(existing)) == "cannot be read and written (EACCES)"
+    assert adapters.wake_problem(str(tmp_path / "brand-new.jsonl")) == f"cannot be made in {tmp_path} (EACCES)"
+    monkeypatch.setattr(adapters.os, "open", real_open)
+    # With the real open, access saying no is overruled by a probe that succeeds: the
+    # existing file is untouched, the directory probe's temporary is gone again.
+    assert adapters.wake_problem(str(existing)) == ""
+    assert existing.read_bytes() == b'{"id":"old"}\n'
+    assert adapters.wake_problem(str(tmp_path / "brand-new.jsonl")) == ""
+    assert not (tmp_path / "brand-new.jsonl").exists()
+    assert [n for n in os.listdir(tmp_path) if n.startswith(f".amb-wake-{os.getpid()}-")] == [live.name]  # the probes left nothing of their own
+    # An append-only wake file (chattr +a) is fine for an append: the probe asks with
+    # the delivery's own flags, so a write-without-append refusal is never the answer.
+    real_open2 = os.open
+
+    def no_plain_write(p, flags, *a):
+        if Path(p) == existing and flags & os.O_WRONLY | flags & os.O_RDWR and not flags & os.O_APPEND:
+            raise PermissionError(1, "Operation not permitted")
+        return real_open2(p, flags, *a)
+
+    monkeypatch.setattr(adapters.os, "open", no_plain_write)
+    assert adapters.wake_problem(str(existing)) == ""
+    monkeypatch.setattr(adapters.os, "open", real_open)
+    monkeypatch.setattr(adapters, "_access", real_access)
+    hidden_mode_restore = [(locked_dir, 0o700)]
+    for bad in leaves + (str(afile / "in.jsonl"), str(afile / "deeper" / "in.jsonl"), str(dangling / "in.jsonl"), str(dangling / "deeper" / "in.jsonl"), "inbox/g.jsonl", "./~no-such-user-amb/in.jsonl", "~", "~no-such-user-amb", ["/x"], "/x/\0y", "/", str(directory), Path("/x/y.jsonl"), False, 0, str(tmp_path / "new" / ".."), "~/.."):
+        with pytest.raises(ProtocolError) as err:
+            save_binding(tmp_path / "reg", {"name": "grok-w", "harness": "grok", "pid": os.getpid(), "wake": bad})
+        assert err.value.code == "bad-wake", bad
+        assert deliver_wake({"wake": bad}, msg) is False, bad
+        if isinstance(bad, Path):
+            continue  # a Path cannot be in a session file at all
+        (tmp_path / "reg" / "grok-w.json").write_text(json.dumps({"name": "grok-w", "harness": "grok", "pid": os.getpid(), "wake": bad}))
+        # The liveness scan judges the string only; a directory is caught at delivery.
+        by_stat = bad in ("/", str(directory)) or bad in leaves or (isinstance(bad, str) and (bad.startswith(str(afile)) or bad.startswith(str(dangling))))
+        assert ("grok-w" in load_live(tmp_path / "reg")) == by_stat, bad
+    hidden_dir.chmod(0o700)
+    for d, m in hidden_mode_restore:
+        d.chmod(m)
+    # The command line makes a relative path absolute where the session runs.
+    monkeypatch_cwd = tmp_path / "proj"
+    monkeypatch_cwd.mkdir()
+    here = os.getcwd()
+    os.chdir(monkeypatch_cwd)
+    try:
+        cli_main(["bind", "grok-v", "--harness", "grok", "--wake", "inbox/g.jsonl", "--registry", str(tmp_path / "reg")])
+    finally:
+        os.chdir(here)
+    assert json.loads((tmp_path / "reg" / "grok-v.json").read_text())["wake"] == str(monkeypatch_cwd / "inbox" / "g.jsonl")
+    # And it judges a ~ path as typed, before expanding it into an ordinary one: with
+    # HOME pointing nowhere, "~" expanded first would be an acceptable missing file.
+    monkeypatch.setenv("HOME", str(tmp_path / "no-such-home"))
+    for typed, why in (("~", "home directory"), ("~/", "home directory"), ("~no-such-user-amb/in.jsonl", "expanded"), (str(directory), "is a directory")):
+        with pytest.raises(SystemExit) as exit_:
+            cli_main(["bind", "grok-u", "--harness", "grok", "--wake", typed, "--registry", str(tmp_path / "reg")])
+        assert "bad-wake" in str(exit_.value) and why in str(exit_.value), typed
+    assert not (tmp_path / "reg" / "grok-u.json").exists()
+    # Only a path that starts with ~ is expanded: "./~/x" is a directory called "~".
+    os.chdir(monkeypatch_cwd)
+    try:
+        cli_main(["bind", "grok-t", "--harness", "grok", "--wake", "./~/in.jsonl", "--registry", str(tmp_path / "reg")])
+    finally:
+        os.chdir(here)
+    assert json.loads((tmp_path / "reg" / "grok-t.json").read_text())["wake"] == str(monkeypatch_cwd / "~" / "in.jsonl")
+    monkeypatch.delenv("HOME")
+    # The liveness scan judges the string and touches no filesystem: a hand-written
+    # "~/x" is not live (session files hold absolute paths), a directory is live by
+    # the scan and refused at delivery, and a wake of None is fine for a harness
+    # that ignores it.
+    (tmp_path / "reg" / "grok-s.json").write_text(json.dumps({"name": "grok-s", "harness": "grok", "pid": os.getpid(), "wake": "~/in.jsonl"}))
+    (tmp_path / "reg" / "grok-r.json").write_text(json.dumps({"name": "grok-r", "harness": "grok", "pid": os.getpid(), "wake": str(directory)}))
+    live = load_live(tmp_path / "reg")
+    assert "grok-s" not in live and "grok-r" in live  # no HOME: "~/" cannot be judged without a lookup
+    assert deliver_wake(live["grok-r"], msg) is False
+    save_binding(tmp_path / "reg", {"name": "dsh-1", "harness": "dsh", "pid": 0, "wake": None, "socket": str(tmp_path / "s")})
+    # With HOME set, "~/x" in an old session file is judged from HOME alone and is live;
+    # a binding saved through the library with "~/x" is stored expanded.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert "grok-s" in load_live(tmp_path / "reg")
+    save_binding(tmp_path / "reg", {"name": "grok-q", "harness": "grok", "pid": os.getpid(), "wake": "~/q.jsonl"})
+    assert json.loads((tmp_path / "reg" / "grok-q.json").read_text())["wake"] == str(tmp_path / "q.jsonl")
+    assert "grok-q" in load_live(tmp_path / "reg")
+    # The scan and the save agree on the odd spellings: "~/" is a home directory for
+    # both, "~//x" is HOME/x for both, and a HOME with ".." or an empty or relative
+    # HOME makes "~/x" unusable for both instead of saved-then-dead.
+    for odd_wake, home, saved in (("~/", str(tmp_path), False), ("~//x.jsonl", str(tmp_path), True), ("~/x.jsonl", str(tmp_path / "sub" / ".."), False), ("~/x.jsonl", "", False), ("~/x.jsonl", "relative", False)):
+        monkeypatch.setenv("HOME", home)
+        (tmp_path / "reg" / "grok-p.json").write_text(json.dumps({"name": "grok-p", "harness": "grok", "pid": os.getpid(), "wake": odd_wake}))
+        scanned = "grok-p" in load_live(tmp_path / "reg")
+        if saved:
+            save_binding(tmp_path / "reg", {"name": "grok-o", "harness": "grok", "pid": os.getpid(), "wake": odd_wake})
+            assert json.loads((tmp_path / "reg" / "grok-o.json").read_text())["wake"] == str(tmp_path / "x.jsonl")
+            assert scanned and "grok-o" in load_live(tmp_path / "reg") and deliver_wake({"wake": odd_wake}, msg), (odd_wake, home)
+        else:
+            with pytest.raises(ProtocolError) as err:
+                save_binding(tmp_path / "reg", {"name": "grok-o", "harness": "grok", "pid": os.getpid(), "wake": odd_wake})
+            assert err.value.code == "bad-wake"
+            assert not scanned and deliver_wake({"wake": odd_wake}, msg) is False, (odd_wake, home)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # A Claude binding's stray wake is not judged, by the library or by the command
+    # line: those harnesses never read it. A Grok binding without one is refused.
+    save_binding(tmp_path / "reg", {"name": "cl-1", "harness": "claude", "pid": os.getpid(), "wake": "whatever", "socket": ""})
+    cli_main(["bind", "cl-2", "--harness", "claude", "--wake", "~", "--registry", str(tmp_path / "reg")])
+    assert json.loads((tmp_path / "reg" / "cl-2.json").read_text())["wake"] == "~"
+    for missing in (None, ""):
+        with pytest.raises(ProtocolError) as err:
+            save_binding(tmp_path / "reg", {"name": "grok-n", "harness": "grok", "pid": os.getpid(), "wake": missing})
+        assert err.value.code == "bad-wake" and "needs a wake path" in err.value.detail
+    with pytest.raises(SystemExit) as exit_:
+        cli_main(["bind", "grok-n", "--harness", "grok", "--registry", str(tmp_path / "reg")])
+    assert "needs a wake path" in str(exit_.value)
+    # A binding the scan refuses is logged once per name and path while the table
+    # holds it; the table is bounded only so a host with a thousand dead session
+    # files cannot grow it without end.
+    import agentmailbus.registry as registry_module
+
+    monkeypatch.setattr(registry_module, "_said", {})
+    monkeypatch.setattr(registry_module, "_SAID_CAP", 4)
+    dead_reg = tmp_path / "reg-dead"
+    for i in range(4):
+        save_binding(dead_reg, {"name": f"grok-dead{i}", "harness": "grok", "pid": os.getpid(), "wake": str(tmp_path / f"ok{i}.jsonl")})
+        (dead_reg / f"grok-dead{i}.json").write_text(json.dumps({"name": f"grok-dead{i}", "harness": "grok", "pid": os.getpid(), "wake": f"relative{i}.jsonl"}))
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="agentmailbus.registry"):
+        for _ in range(3):
+            assert load_live(dead_reg) == {}
+    said = [r.getMessage() for r in caplog.records if "is not live" in r.getMessage()]
+    assert len(set(said)) == 4 and len(said) == 4  # every dead binding once, over three scans
+    assert len(registry_module._said) == 4
+    # A fifth forgets the oldest, and only the oldest, which is then said again.
+    oldest = next(iter(registry_module._said))
+    (dead_reg / "grok-dead4.json").write_text(json.dumps({"name": "grok-dead4", "harness": "grok", "pid": os.getpid(), "wake": "relative4.jsonl"}))
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="agentmailbus.registry"):
+        load_live(dead_reg)
+    assert len(registry_module._said) == 4 and oldest not in registry_module._said
+    assert [r.getMessage() for r in caplog.records if "is not live" in r.getMessage()] == ["session grok-dead4 is not live: its wake path relative4.jsonl is not absolute"]
+    oldest_name = oldest.split(":")[0]
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="agentmailbus.registry"):
+        load_live(dead_reg)
+    assert any(f"session {oldest_name} is not live" in r.getMessage() for r in caplog.records)  # the forgotten one is said again
+    # A legacy file with no wake path is not live and says so once.
+    monkeypatch.setattr(registry_module, "_SAID_CAP", 1024)
+    (dead_reg / "grok-nowake.json").write_text(json.dumps({"name": "grok-nowake", "harness": "grok", "pid": os.getpid(), "wake": ""}))
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="agentmailbus.registry"):
+        load_live(dead_reg)
+        load_live(dead_reg)
+    assert [r.getMessage() for r in caplog.records if "no wake path" in r.getMessage()] == ["session grok-nowake is not live: it has no wake path"]
+    # And the scan touches nothing on the filesystem for a Grok wake path.
+    class NoStat(type(Path())):
+        def stat(self, *a, **k):
+            pytest.fail("stat on the relay loop")
+
+        def lstat(self):
+            pytest.fail("stat on the relay loop")
+
+        def is_dir(self):
+            pytest.fail("stat on the relay loop")
+
+        def exists(self, *a, **k):
+            pytest.fail("stat on the relay loop")
+
+        def expanduser(self):
+            pytest.fail("user lookup on the relay loop")
+
+    class NoFsPath:  # os.path as the adapters module sees it
+        def __getattr__(self, name):
+            if name in ("lexists", "exists", "isdir", "isfile", "expanduser", "realpath"):
+                return lambda *a, **k: pytest.fail("stat on the relay loop")
+            return getattr(os.path, name)
+
+    class NoFs:  # os as the adapters module sees it: every file inspection fails the test
+        path = NoFsPath()
+
+        def __getattr__(self, name):
+            if name in ("stat", "lstat", "access", "listdir", "open"):
+                return lambda *a, **k: pytest.fail("stat on the relay loop")
+            return getattr(os, name)
+
+    grok_reg = tmp_path / "reg-grok"  # Grok bindings only: a Claude or dsh socket check is the documented exception
+    grok_reg.mkdir()
+    for name in ("grok-q", "grok-r", "grok-s"):
+        (grok_reg / f"{name}.json").write_bytes((tmp_path / "reg" / f"{name}.json").read_bytes())
+    monkeypatch.setattr(adapters, "Path", NoStat)
+    monkeypatch.setattr(adapters, "os", NoFs())
+    (tmp_path / "q.jsonl").write_text("")
+    for probe in (str(tmp_path / "nowhere" / "x.jsonl"), str(tmp_path / "q.jsonl")):  # a missing leaf and an existing one
+        with pytest.raises(BaseException, match="stat on the relay loop"):
+            adapters.wake_problem(probe)  # the probe does land where the save-time judge looks
+    assert set(load_live(grok_reg)) == {"grok-q", "grok-r", "grok-s"}
+    monkeypatch.undo()
+
+
+def test_legacy_rows_handed_out_before_delivered_at_existed_still_take_an_ack(tmp_path: Path) -> None:
+    import sqlite3
+
+    db = tmp_path / "broker.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE agents (name TEXT PRIMARY KEY, host TEXT NOT NULL, harness TEXT NOT NULL,
+                             online INTEGER NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE messages (id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                               from_host TEXT NOT NULL, text TEXT NOT NULL, priority TEXT NOT NULL,
+                               created_at TEXT NOT NULL, state TEXT NOT NULL);
+        INSERT INTO messages VALUES ('in-flight', 'a', 'b', 'h', 't', 'next', '', 'delivered');
+        INSERT INTO messages VALUES ('never-sent', 'a', 'b', 'h', 't', 'next', '', 'queued');
+        """
+    )
+    conn.commit()
+    conn.close()
+    store = BrokerStore(db)
+    assert store.get_message("in-flight")["state"] == "queued"  # requeued by startup
+    assert store.get_message("in-flight")["delivered_at"] != ""
+    store.ack("in-flight")  # the relay that wrote it under the old broker acks it now
+    assert store.get_message("in-flight")["state"] == "acked"
+    store.ack("never-sent")
+    assert store.get_message("never-sent")["state"] == "queued"  # never handed out: ignored
+
+    # A database with attempts but no delivered_at: a requeued row that had been tried is stamped too.
+    db2 = tmp_path / "broker2.db"
+    conn = sqlite3.connect(db2)
+    conn.executescript(
+        """
+        CREATE TABLE agents (name TEXT PRIMARY KEY, host TEXT NOT NULL, harness TEXT NOT NULL,
+                             online INTEGER NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE messages (id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                               from_host TEXT NOT NULL, text TEXT NOT NULL, priority TEXT NOT NULL,
+                               created_at TEXT NOT NULL, state TEXT NOT NULL,
+                               attempts INTEGER NOT NULL DEFAULT 0, not_before TEXT NOT NULL DEFAULT '',
+                               finished_at TEXT NOT NULL DEFAULT '');
+        INSERT INTO messages VALUES ('tried', 'a', 'b', 'h', 't', 'next', '2026-01-01T00:00:00+00:00', 'queued', 2, '', '');
+        INSERT INTO messages VALUES ('fresh', 'a', 'b', 'h', 't', 'next', '2026-01-01T00:00:00+00:00', 'queued', 0, '', '');
+        """
+    )
+    conn.commit()
+    conn.close()
+    store2 = BrokerStore(db2)
+    store2.ack("tried")
+    store2.ack("fresh")
+    assert store2.get_message("tried")["state"] == "acked"
+    assert store2.get_message("fresh")["state"] == "queued"
+
+    # A database whose column exists but was never stamped (an in-between build) is
+    # repaired too: the backfill does not depend on the column being new.
+    db3 = tmp_path / "broker3.db"
+    conn = sqlite3.connect(db3)
+    conn.executescript(
+        """
+        CREATE TABLE agents (name TEXT PRIMARY KEY, host TEXT NOT NULL, harness TEXT NOT NULL,
+                             online INTEGER NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE messages (id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+                               from_host TEXT NOT NULL, text TEXT NOT NULL, priority TEXT NOT NULL,
+                               created_at TEXT NOT NULL, state TEXT NOT NULL,
+                               attempts INTEGER NOT NULL DEFAULT 0, not_before TEXT NOT NULL DEFAULT '',
+                               finished_at TEXT NOT NULL DEFAULT '', delivered_at TEXT NOT NULL DEFAULT '');
+        INSERT INTO messages VALUES ('unstamped', 'a', 'b', 'h', 't', 'next', '2026-01-01T00:00:00+00:00', 'delivered', 0, '', '', '');
+        """
+    )
+    conn.commit()
+    conn.close()
+    store3 = BrokerStore(db3)
+    store3.ack("unstamped")
+    assert store3.get_message("unstamped")["state"] == "acked"
