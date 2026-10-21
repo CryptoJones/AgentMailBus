@@ -19,6 +19,7 @@ from agentmailbus.protocol import (
     check_id,
     check_name,
     check_priority,
+    check_recipient,
     check_text,
     dumps,
     loads,
@@ -404,7 +405,7 @@ class Relay:
     ) -> dict:
         """Send one message. A caller that retries passes the same `mid` again."""
         sender = check_name(sender, "from")
-        recipient = check_name(recipient, "to")
+        recipient = check_recipient(recipient)
         text = check_text(text)
         priority = check_priority(priority)
         mid = check_id(mid) if mid else str(uuid.uuid4())
@@ -448,7 +449,13 @@ class Relay:
             raise LocalError("timeout") from None
         if msg.get("type") != "accepted":
             return {"ok": False, "id": mid, "error": msg.get("error", "rejected")}
-        return {"ok": True, "id": mid, "waiting": bool(msg.get("waiting"))}
+        out = {"ok": True, "id": mid, "waiting": bool(msg.get("waiting"))}
+        if "recipients" in msg:
+            names = msg.get("recipients")
+            out["recipients"] = [n for n in names if isinstance(n, str)] if isinstance(names, list) else []
+            if type(msg.get("more")) is int:
+                out["more"] = msg["more"]
+        return out
 
     async def local_who(self) -> dict:
         if self.ws is None:

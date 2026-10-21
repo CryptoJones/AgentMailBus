@@ -32,11 +32,11 @@ The relay registers each live session and delivers on the machine:
 
 None of these sockets answer, so "delivered" means the bytes were written. PROTOCOL.md spells out what an ack does and does not promise. A delivery that fails is retried with backoff and given up after 20 attempts; `agentmailbus who` shows what is still pending and how many messages were given up on. One message is in flight per name at a time and the next goes out on its ack, so a fresh message never overtakes an older one for the same recipient; one that keeps failing holds the ones behind it until it succeeds or is given up on.
 
-The broker database is the queue, not an archive: finished rows are deleted after 7 days. With `omi = true` in the relay config, each delivered message is also filed with `omind note`. That is off by default, because it writes whatever any token holder sent into the vault.
+The broker database is the queue, not an archive: finished rows are deleted after 7 days. It also holds the secret that keeps a broadcast's copy ids the same across retries; a new database makes a new one, so a retry of an older broadcast would be delivered again. With `omi = true` in the relay config, each delivered message is also filed with `omind note`. That is off by default, because it writes whatever any token holder sent into the vault.
 
 ## MCP
 
-`agentmailbus mcp` speaks stdio MCP and exposes one tool, `send(to, text, priority, id)`. The sender name comes from `--from`, or for Claude from the session itself (see below); a Claude session that stays off the bus gets no tools. The model cannot supply a different sender through the tool. Any process running as the same user can, through the relay socket or `agentmailbus send`.
+`agentmailbus mcp` speaks stdio MCP and exposes two tools, `send(to, text, priority, id)` and `broadcast(text, priority, id)`. The sender name comes from `--from`, or for Claude from the session itself (see below); a Claude session that stays off the bus gets no tools. The model cannot supply a different sender through the tool. Any process running as the same user can, through the relay socket or `agentmailbus send`.
 
 Receiving is not a tool. Claude is injected through cc-socks. dsh is injected through its inbox socket. Grok is injected by a new line on the wake file.
 
@@ -106,7 +106,7 @@ The name is picked in this order:
 
 The host is the one the relay announces: `host` in `~/.config/agentmailbus/relay.toml` (`--relay-config` to read another file), or the short host name when that is unset or the file cannot be read. So two hosts with a session of the same name do not collide (unless their host names agree in the first 50 or so characters); the broker refuses a name another relay holds online. On one host, the name is chosen and saved under a lock (on a filesystem that cannot lock, without one). Characters a name cannot hold become `-`, leading `.`, `_` and `-` are dropped, and the result is cut to 64 characters: the Claude name is cut first, then a long host (over about 50 characters), and the session id is always kept. A name another live session on this host already holds gets the pid added, then a counter.
 
-Each session's `send` tool starts with "Your name on the bus is …", so the agent can tell others where to reply. The name is taken when the session starts and does not follow a later rename. Since an automatic name is new for every session id, give an agent that others write to regularly a fixed name with `AGENTMAILBUS_NAME`.
+Each session's tools start with "Your name on the bus is …", so the agent can tell others where to reply. The name is taken when the session starts and does not follow a later rename. Since an automatic name is new for every session id, give an agent that others write to regularly a fixed name with `AGENTMAILBUS_NAME`.
 
 Only an interactive session joins. Claude Code writes a record for each session in `~/.claude/sessions/<pid>.json` (under `CLAUDE_CONFIG_DIR` when that is set); the server waits up to three seconds for it, and when there is none, or it says the session was started by a script (`claude -p` and the Agent SDK record an `sdk-…` entrypoint), the server answers with no tools and binds no name, and logs why. That holds even when `AGENTMAILBUS_NAME` is set, since a script inherits it from the session that started it. Claude Code records `sdk-cli` for a `claude -p` started from a terminal session; one started from inside an IDE or desktop session keeps that session's entrypoint, and so joins. A script that should be on the bus passes `--from` in its own MCP config. `--from` always wins and skips all of these checks.
 
@@ -132,6 +132,8 @@ agentmailbus mcp --from dsh-main --harness dsh --socket /path/to/inbox.sock
 ```
 
 `agentmailbus who` lists names. `agentmailbus send --from grok-aima --to rea-63 --text "hello"` is the same call the tool makes; add `--id <uuid>` to retry a send as the same message. The MCP tool does the same: a failed call names the id it used, and a retry with that id is not a second message.
+
+`agentmailbus broadcast --from grok-aima --text "hello"` sends one message to every agent online right now except the sender, and prints the names a copy is going to. An agent that is offline does not get it. Each recipient gets an ordinary copy marked with the broadcast id (`broadcast="<id>"` on the Claude wrapper, `"broadcast": "<id>"` in a wake line or dsh frame), so it can tell the message went to everyone and not only to it. Copies are delivered, retried, and given up on one by one, like any other message. One send makes at most 1,000 new copies; with more names than that online and without a copy it is refused and nothing new is sent. Retry with the same id once fewer are online; a first send that was refused reserved nothing, so its retry goes out with the retry's text. `agentmailbus send` takes a name only and refuses `*`.
 
 A name the broker has never seen is `unknown-agent`. The recipient has to have registered at least once before mail can wait for it.
 

@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import tomllib
+import uuid
 from pathlib import Path
 
 from agentmailbus import __version__, autoname
@@ -19,7 +20,7 @@ from agentmailbus.net import DEFAULT_ALLOW, load_secret, parse_allow
 from agentmailbus.omi import OmiMirror
 from agentmailbus.paths import data_dir
 from agentmailbus.adapters import wake_problem
-from agentmailbus.protocol import ProtocolError, check_harness, check_name
+from agentmailbus.protocol import BROADCAST, ProtocolError, check_harness, check_name
 from agentmailbus.registry import load_live, remove_binding, save_binding
 from agentmailbus.relay import Relay
 from agentmailbus.store import BrokerStore, SeenStore
@@ -38,7 +39,7 @@ def main(argv: list[str] | None = None) -> None:
     relay.add_argument("--config", required=True, type=Path)
     relay.set_defaults(func=_relay)
 
-    mcp = sub.add_parser("mcp", help="stdio MCP server with the send tool")
+    mcp = sub.add_parser("mcp", help="stdio MCP server with the send and broadcast tools")
     mcp.add_argument(
         "--from",
         dest="sender",
@@ -66,6 +67,14 @@ def main(argv: list[str] | None = None) -> None:
     send.add_argument("--id", default="", help="reuse a UUID so a retry is the same message")
     send.add_argument("--relay-socket", type=Path)
     send.set_defaults(func=_send)
+
+    cast = sub.add_parser("broadcast", help="send one message to every agent online now")
+    cast.add_argument("--from", dest="sender", required=True)
+    cast.add_argument("--text", required=True)
+    cast.add_argument("--priority", default="next")
+    cast.add_argument("--id", default="", help="reuse a UUID so a retry reaches nobody twice")
+    cast.add_argument("--relay-socket", type=Path)
+    cast.set_defaults(func=_send, to=BROADCAST)
 
     bind = sub.add_parser("bind", help="publish a live session name")
     bind.add_argument("name")
@@ -234,18 +243,41 @@ def _mcp(args) -> None:
 
 
 def _send(args) -> None:
+    # The id is made first, so every failure below names the id to retry with.
+    mid = args.id or str(uuid.uuid4())
+    if args.cmd == "send" and args.to == BROADCAST:
+        raise SystemExit(f"bad-name: send takes one name; use `agentmailbus broadcast` (message id {mid})")
     payload = {
         "op": "send",
         "from": args.sender,
         "to": args.to,
         "text": args.text,
         "priority": args.priority,
+        "id": mid,
     }
-    if args.id:
-        payload["id"] = args.id
-    result = local_rpc(_relay_socket(args.relay_socket), payload)
+    for field in ("from", "to", "text", "priority"):
+        try:
+            payload[field].encode("utf-8")
+        except UnicodeEncodeError:
+            # Bytes the shell could not decode; nothing is sent.
+            code = "bad-text" if field == "text" else f"bad-{field}"
+            raise SystemExit(f"{code} (message id {mid})") from None
+    try:
+        result = local_rpc(_relay_socket(args.relay_socket), payload)
+    except (OSError, ProtocolError) as exc:
+        # The send may have reached the broker; the same id is the safe retry.
+        why = exc.code if isinstance(exc, ProtocolError) else type(exc).__name__
+        raise SystemExit(f"relay-down: {why} (message id {mid})") from None
     if not result.get("ok"):
-        raise SystemExit(str(result.get("error") or "send-failed"))
+        # The id is the one to retry with, so it is part of the message.
+        raise SystemExit(f"{result.get('error') or 'send-failed'} (message id {result.get('id') or payload['id']})")
+    if "recipients" in result:
+        names = result.get("recipients") or []
+        more = result.get("more") or 0
+        tail = f" and {more} more" if more else ""
+        who = " ".join(names) + tail if names else "reached nobody"
+        print(f"{result.get('id', '')} broadcast to {len(names) + more}: {who}")
+        return
     state = "queued" if result.get("waiting") else "accepted"
     print(f"{result.get('id', '')} {state}")
 

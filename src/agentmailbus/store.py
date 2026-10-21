@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import hmac
+import secrets
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -76,12 +80,27 @@ class BrokerStore:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 not_before TEXT NOT NULL DEFAULT '',
                 finished_at TEXT NOT NULL DEFAULT '',
-                delivered_at TEXT NOT NULL DEFAULT ''
+                delivered_at TEXT NOT NULL DEFAULT '',
+                broadcast TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS messages_q ON messages(recipient, state);
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id TEXT PRIMARY KEY,
+                sender TEXT NOT NULL,
+                text TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         self._migrate()
+        # Made now, so a backup of the database holds it before the first broadcast.
+        self.broadcast_salt("00000000-0000-0000-0000-000000000000", "")
         self.startup()
 
     def _migrate(self) -> None:
@@ -104,6 +123,10 @@ class BrokerStore:
         self.conn.execute(
             "UPDATE messages SET delivered_at=created_at WHERE delivered_at='' AND (state='delivered' OR attempts>0)"
         )
+        if "broadcast" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN broadcast TEXT NOT NULL DEFAULT ''")
+        # After the column exists, so an older database can take it.
+        self.conn.execute("CREATE INDEX IF NOT EXISTS messages_b ON messages(broadcast)")
         self.conn.execute(
             "UPDATE messages SET finished_at=? WHERE finished_at='' AND state IN ('acked', 'failed')",
             (now,),
@@ -159,16 +182,59 @@ class BrokerStore:
         recipient: str,
         text: str,
         priority: str,
+        broadcast: str = "",
     ) -> None:
-        """The broker stamps the time. Nothing the sender supplies decides the order."""
+        """The broker stamps the time. Nothing the sender supplies decides the order.
+        `broadcast` is the broadcast id when this row is one recipient's copy."""
         self.conn.execute(
             """
-            INSERT INTO messages(id, sender, recipient, from_host, text, priority, created_at, state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')
+            INSERT INTO messages(id, sender, recipient, from_host, text, priority, created_at, state, broadcast)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
             """,
-            (mid, sender, recipient, self.host_of(sender), text, priority, _now()),
+            (mid, sender, recipient, self.host_of(sender), text, priority, _now(), broadcast),
         )
         self.conn.commit()
+
+    def get_broadcast(self, broadcast_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM broadcasts WHERE id=?", (broadcast_id,)).fetchone()
+        return None if row is None else dict(row)
+
+    def insert_broadcast(self, broadcast_id: str, sender: str, text: str, priority: str) -> dict:
+        """Record a broadcast before any copy is made, so its id and sender are
+        reserved even when it reaches nobody, and a retry reuses its text."""
+        self.conn.execute(
+            "INSERT INTO broadcasts(id, sender, text, priority, salt, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (broadcast_id, sender, text, priority, self.broadcast_salt(broadcast_id, sender), _now()),
+        )
+        self.conn.commit()
+        row = self.get_broadcast(broadcast_id)
+        assert row is not None
+        return row
+
+    def broadcast_salt(self, broadcast_id: str, sender: str) -> str:
+        """The salt for a broadcast's copy ids: keyed by a secret this database keeps,
+        so it is the same for the same sender and id however long ago the record was
+        pruned (a relay that injected a copy still recognises it), different for
+        another sender reusing the id, and nobody outside the broker can work it out."""
+        row = self.conn.execute("SELECT value FROM meta WHERE key='broadcast_secret'").fetchone()
+        if row is None:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('broadcast_secret', ?)",
+                (secrets.token_hex(32),),
+            )
+            self.conn.commit()
+            row = self.conn.execute("SELECT value FROM meta WHERE key='broadcast_secret'").fetchone()
+        digest = hmac.new(
+            bytes.fromhex(row["value"]), f"{sender}\0{broadcast_id}".encode(), hashlib.sha256
+        ).digest()
+        return str(uuid.UUID(bytes=digest[:16]))
+
+    def broadcast_copies(self, broadcast_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT recipient, state FROM messages WHERE broadcast=? ORDER BY recipient",
+            (broadcast_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_message(self, mid: str) -> dict | None:
         row = self.conn.execute("SELECT rowid, * FROM messages WHERE id=?", (mid,)).fetchone()
@@ -281,12 +347,23 @@ class BrokerStore:
 
     def prune(self, days: float = RETENTION_DAYS) -> int:
         """Drop rows that finished more than `days` ago. That is also the id de-duplication window."""
+        cutoff = _before(days)
         cur = self.conn.execute(
             "DELETE FROM messages WHERE state IN ('acked', 'failed') AND finished_at < ?",
-            (_before(days),),
+            (cutoff,),
+        )
+        dropped = cur.rowcount
+        # A broadcast record goes once it is old and none of its copies is left. Its
+        # salt does not depend on the record, so a later retry makes the same copy ids.
+        cur = self.conn.execute(
+            """
+            DELETE FROM broadcasts WHERE created_at < ?
+            AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.broadcast = broadcasts.id)
+            """,
+            (cutoff,),
         )
         self.conn.commit()
-        return cur.rowcount
+        return dropped + cur.rowcount
 
     def directory(self) -> list[dict]:
         rows = self.conn.execute(

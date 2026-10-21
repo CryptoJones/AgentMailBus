@@ -1,4 +1,4 @@
-"""Stdio MCP server. The only tool is send. Receiving is the relay's job.
+"""Stdio MCP server. The tools are send and broadcast. Receiving is the relay's job.
 
 MCP stdio framing is one JSON-RPC object per line, no headers. A line may also hold a
 JSON array (a batch); the reply is then an array.
@@ -12,7 +12,14 @@ import sys
 import uuid
 
 from agentmailbus import __version__
-from agentmailbus.protocol import ProtocolError, check_id, check_name, check_priority, check_text
+from agentmailbus.protocol import (
+    BROADCAST,
+    ProtocolError,
+    check_id,
+    check_name,
+    check_priority,
+    check_text,
+)
 
 log = logging.getLogger("agentmailbus.mcp")
 
@@ -49,6 +56,30 @@ SEND_TOOL = {
 }
 
 
+BROADCAST_TOOL = {
+    "name": "broadcast",
+    "description": (
+        "Send one message to every agent that is online right now, except you. "
+        "Agents offline when you send it do not get it. Each recipient sees it "
+        "marked as a broadcast. The result lists up to 1,000 agents a copy is going to "
+        "and counts the rest. "
+        "A failure names the message id it used and says whether to retry with that id "
+        "or to send a new message; a retry with the same id is the same broadcast "
+        "and is not delivered twice while the broker keeps it."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "priority": SEND_TOOL["inputSchema"]["properties"]["priority"],
+            "id": SEND_TOOL["inputSchema"]["properties"]["id"],
+        },
+        "required": ["text"],
+        "additionalProperties": False,
+    },
+}
+
+
 class _Eof:
     pass
 
@@ -79,7 +110,11 @@ def handle_request(msg: dict, sender: str | None, rpc) -> dict | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        tools = [_named_tool(SEND_TOOL, sender)] if sender is not None else []
+        tools = (
+            [_named_tool(SEND_TOOL, sender), _named_tool(BROADCAST_TOOL, sender)]
+            if sender is not None
+            else []
+        )
         return {"jsonrpc": "2.0", "id": mid, "result": {"tools": tools}}
     if method == "tools/call":
         return _call(mid, params, sender, rpc)
@@ -97,7 +132,8 @@ def _named_tool(tool: dict, sender: str) -> dict:
 
 
 def _call(mid, params: dict, sender: str | None, rpc) -> dict:
-    if sender is None or params.get("name") != "send":
+    tool = params.get("name")
+    if sender is None or tool not in {"send", "broadcast"}:
         return _tool_error(mid, "unknown-tool")
     args = params.get("arguments")
     if not isinstance(args, dict):
@@ -108,7 +144,21 @@ def _call(mid, params: dict, sender: str | None, rpc) -> dict:
         return _tool_error(mid, exc.code)
     # From here on the id exists, and every failure names it.
     try:
-        recipient = check_name(args.get("to"), "to")
+        # `send` takes a name only, so a broadcast is always asked for by name.
+        if tool == "broadcast" and "to" in args:
+            # A model that names a recipient did not mean everyone.
+            return _tool_error(
+                mid,
+                f"bad-arguments (message id {msg_id}; nothing was sent): broadcast takes no `to`, "
+                "use send to reach one agent",
+            )
+        if tool == "send" and args.get("to") == BROADCAST:
+            return _tool_error(
+                mid,
+                f"bad-name (message id {msg_id}; nothing was sent): send takes one name, "
+                "use the broadcast tool to reach every agent",
+            )
+        recipient = BROADCAST if tool == "broadcast" else check_name(args.get("to"), "to")
         text = check_text(args.get("text"))
         priority = check_priority(args.get("priority"))
     except ProtocolError as exc:
@@ -130,13 +180,20 @@ def _call(mid, params: dict, sender: str | None, rpc) -> dict:
     if not isinstance(result, dict) or not result.get("ok"):
         code = str(result.get("error") or "send-failed") if isinstance(result, dict) else "send-failed"
         return _tool_error(mid, _named(code, msg_id))
-    state = "queued" if result.get("waiting") else "accepted"
+    if tool == "broadcast":
+        names = result.get("recipients") or []
+        who = ", ".join(names) if names else "reached nobody"
+        more = result.get("more")
+        if isinstance(more, int) and more > 0:
+            who += f" and {more} more"
+        line = f"{result.get('id', msg_id)} broadcast to {len(names) + (more or 0)}: {who}"
+    else:
+        state = "queued" if result.get("waiting") else "accepted"
+        line = f"{result.get('id', msg_id)} {state}"
     return {
         "jsonrpc": "2.0",
         "id": mid,
-        "result": {
-            "content": [{"type": "text", "text": f"{result.get('id', msg_id)} {state}"}],
-        },
+        "result": {"content": [{"type": "text", "text": line}]},
     }
 
 
@@ -151,6 +208,8 @@ TERMINAL = {
 
 
 def _named(code: str, msg_id: str) -> str:
+    if code == "too-many-recipients":
+        return f"{code} (message id {msg_id}; this send made no new copies, retry with this id once fewer agents are online)"
     if code in TERMINAL:
         return f"{code} (message id {msg_id}; not retryable as is, send a new message with a new id)"
     return f"{code} (message id {msg_id}; outcome unknown, retry with this id)"
