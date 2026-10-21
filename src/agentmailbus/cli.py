@@ -7,12 +7,11 @@ import asyncio
 import logging
 import os
 import signal
-import socket
 import sys
 import tomllib
 from pathlib import Path
 
-from agentmailbus import __version__
+from agentmailbus import __version__, autoname
 from agentmailbus.broker import Broker
 from agentmailbus.localcall import local_rpc
 from agentmailbus.mcp import serve_stdio
@@ -21,7 +20,7 @@ from agentmailbus.omi import OmiMirror
 from agentmailbus.paths import data_dir
 from agentmailbus.adapters import wake_problem
 from agentmailbus.protocol import ProtocolError, check_harness, check_name
-from agentmailbus.registry import remove_binding, save_binding
+from agentmailbus.registry import load_live, remove_binding, save_binding
 from agentmailbus.relay import Relay
 from agentmailbus.store import BrokerStore, SeenStore
 
@@ -40,8 +39,18 @@ def main(argv: list[str] | None = None) -> None:
     relay.set_defaults(func=_relay)
 
     mcp = sub.add_parser("mcp", help="stdio MCP server with the send tool")
-    mcp.add_argument("--from", dest="sender", required=True)
+    mcp.add_argument(
+        "--from",
+        dest="sender",
+        help="the session's name; for claude it may be left out, see README",
+    )
     mcp.add_argument("--harness", required=True)
+    mcp.add_argument(
+        "--relay-config",
+        type=Path,
+        default=Path("~/.config/agentmailbus/relay.toml"),
+        help="read for the host part of an automatic name",
+    )
     mcp.add_argument("--pid", type=int)
     mcp.add_argument("--wake", default="")
     mcp.add_argument("--socket", default="")
@@ -103,7 +112,7 @@ def _broker(args) -> None:
 def _relay(args) -> None:
     cfg = _toml(args.config)
     token = load_secret(str(cfg["token"]))
-    host = str(cfg.get("host") or socket.gethostname().split(".")[0])
+    host = autoname.relay_host(cfg)
     check_name(host, "host")
     relay = Relay(
         url=str(cfg["broker"]),
@@ -143,26 +152,85 @@ def _wake_arg(text: str, harness: str) -> str:
 
 
 def _mcp(args) -> None:
-    sender = check_name(args.sender, "from")
+    # SIGTERM and SIGHUP end the server through its cleanup, so the binding file goes.
+    # The first one also ignores any that follow, so nothing cuts the cleanup short.
+    def _stop(*_):
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
+        sys.exit(0)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, _stop)
     harness = check_harness(args.harness)
-    binding = {
-        "name": sender,
-        "harness": harness,
-        "pid": _default_pid(harness, args.pid),
-        "wake": _wake_arg(args.wake, harness),
-        "socket": args.socket,
-    }
-    path = save_binding(_registry(args.registry), binding)
+    pid = _default_pid(harness, args.pid)
     sock = _relay_socket(args.relay_socket)
+    log = logging.getLogger("agentmailbus.mcp")
 
     def rpc(payload: dict) -> dict:
         return local_rpc(sock, payload)
 
+    registry = _registry(args.registry)
+    binding: dict | None = None
+    path: Path | None = None
+    sender: str | None = None
     try:
+        if args.sender is not None:
+            sender = check_name(args.sender, "from")
+            binding = {
+                "name": sender,
+                "harness": harness,
+                "pid": pid,
+                "wake": _wake_arg(args.wake, harness),
+                "socket": args.socket,
+                "server": os.getpid(),
+            }
+            if harness == "claude":
+                binding["sessions_dir"] = str(autoname.sessions_dir())
+            path = registry / f"{sender}.json"
+            _save_locked(registry, binding)
+        elif harness == "claude":
+            session = autoname.read_session(pid)
+            if not autoname.interactive(session):
+                log.info("not joining the bus: pid %d is a scripted session or has no session record", pid)
+            else:
+                try:
+                    # Choosing a name and saving it is one step for every session on this host.
+                    with autoname.registry_lock(registry) as lock:
+                        if lock.locked:
+                            autoname.sweep_dead(registry)
+                        sender = autoname.pick(
+                            pid, session, os.environ.get(autoname.ENV, ""), load_live(registry), args.relay_config
+                        )
+                        if sender is not None:
+                            binding = {
+                                "name": sender,
+                                "harness": harness,
+                                "pid": pid,
+                                "wake": "",
+                                "socket": args.socket or autoname.claude_socket_from(session),
+                                "server": os.getpid(),
+                                # So a recycled pid does not revive this binding, and the
+                                # relay finds the peer key where this session keeps it.
+                                "proc_start": session.get("procStart"),
+                                "sessions_dir": str(autoname.sessions_dir()),
+                            }
+                            path = registry / f"{sender}.json"
+                            save_binding(registry, binding)
+                except TimeoutError:
+                    log.warning("not joining the bus: the session registry stayed locked")
+                    sender = None
+        else:
+            raise SystemExit("--from is required for this harness")
+        if sender is not None:
+            log.info("bound as %s", sender)
         serve_stdio(sender, rpc)
     finally:
-        # Another process may have bound the same name since. Leave its file alone.
-        remove_binding(path, binding)
+        # A second signal must not cut the cleanup short.
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
+        # Only this server's own file. Another process may have bound the name since.
+        if path is not None and binding is not None:
+            _remove_locked(registry, path, binding)
 
 
 def _send(args) -> None:
@@ -182,6 +250,29 @@ def _send(args) -> None:
     print(f"{result.get('id', '')} {state}")
 
 
+def _save_locked(registry: Path, binding: dict) -> Path:
+    """Save under the registry lock, so a startup sweep never removes a file just
+    written. A lock that stays busy stops the save rather than racing the sweep."""
+    try:
+        with autoname.registry_lock(registry):
+            return save_binding(registry, binding)
+    except TimeoutError:
+        raise SystemExit("the session registry stayed locked; nothing was bound") from None
+
+
+def _remove_locked(registry: Path, path: Path, binding: dict) -> None:
+    """Remove this server's own binding under the lock, so a replacement written in
+    the meantime is never the file that goes. If the lock stays busy for a second the
+    file is left: once the session is gone, the next automatic start sweeps it."""
+    try:
+        with autoname.registry_lock(registry, timeout=1.0):
+            remove_binding(path, binding)
+    except TimeoutError:
+        pass
+    except OSError:
+        remove_binding(path, binding)  # no lock to be had here at all
+
+
 def _bind(args) -> None:
     harness = check_harness(args.harness)
     pid = args.pid
@@ -194,13 +285,20 @@ def _bind(args) -> None:
         "wake": _wake_arg(args.wake, harness),
         "socket": args.socket,
     }
-    path = save_binding(_registry(args.registry), binding)
+    if harness == "claude":
+        binding["sessions_dir"] = str(autoname.sessions_dir())
+    path = _save_locked(_registry(args.registry), binding)
     print(path)
 
 
 def _unbind(args) -> None:
-    path = _registry(args.registry) / f"{check_name(args.name)}.json"
-    path.unlink(missing_ok=True)
+    registry = _registry(args.registry)
+    path = registry / f"{check_name(args.name)}.json"
+    try:
+        with autoname.registry_lock(registry):
+            path.unlink(missing_ok=True)
+    except TimeoutError:
+        raise SystemExit("the session registry stayed locked; nothing was removed") from None
 
 
 def _who(args) -> None:
