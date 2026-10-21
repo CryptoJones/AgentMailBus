@@ -80,15 +80,21 @@ def escape_text(text: str) -> str:
     return _TAG.sub(r"&lt;\1cross-session-message", text)
 
 
+def _attr(value: object) -> str:
+    """A value fit for an attribute of the wrapper tag."""
+    return re.sub(r'[^A-Za-z0-9-]', "", str(value))
+
+
 def claude_frames(binding: dict, message: dict) -> list[bytes]:
     sock_path = binding.get("socket") or claude_socket(int(binding["pid"]))
     body = (
-        '<cross-session-message from="{host}" from-name="{name}" from-mode="agentmailbus">\n'
+        '<cross-session-message from="{host}" from-name="{name}" from-mode="agentmailbus"{extra}>\n'
         "{text}\n"
         "</cross-session-message>"
     ).format(
         host=message.get("from_host") or "agentmailbus",
         name=message["from"],
+        extra=' broadcast="{}"'.format(_attr(message["broadcast"])) if message.get("broadcast") else "",
         text=escape_text(message["text"]),
     )
     user = {
@@ -384,17 +390,17 @@ def deliver_wake(binding: dict, message: dict) -> bool:
         return False
     path = Path(binding["wake"]).expanduser()
     private_dir(path.parent)
-    line = json.dumps(
-        {
-            "id": message["id"],
-            "from": message["from"],
-            "from_host": message.get("from_host") or "",
-            "to": message["to"],
-            "ts": message.get("created_at") or message.get("ts") or "",
-            "text": message["text"],
-        },
-        ensure_ascii=False,
-    )
+    record = {
+        "id": message["id"],
+        "from": message["from"],
+        "from_host": message.get("from_host") or "",
+        "to": message["to"],
+        "ts": message.get("created_at") or message.get("ts") or "",
+        "text": message["text"],
+    }
+    if message.get("broadcast"):
+        record["broadcast"] = message["broadcast"]
+    line = json.dumps(record, ensure_ascii=False)
     with _wake_lock(path):
         _sweep_temps(path.parent)
         return _append_line(path, (line + "\n").encode())
@@ -643,15 +649,16 @@ def deliver_dsh(binding: dict, message: dict) -> bool:
     The frame is AgentMailBus's contract. Confirm it against a live dsh before
     treating it as that program's native protocol.
     """
-    payload = _line(
-        {
-            "type": "user",
-            "id": message["id"],
-            "from": message["from"],
-            "from_host": message.get("from_host") or "",
-            "text": message["text"],
-        }
-    )
+    frame = {
+        "type": "user",
+        "id": message["id"],
+        "from": message["from"],
+        "from_host": message.get("from_host") or "",
+        "text": message["text"],
+    }
+    if message.get("broadcast"):
+        frame["broadcast"] = message["broadcast"]
+    payload = _line(frame)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(5)

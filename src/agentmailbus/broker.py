@@ -8,13 +8,17 @@ from typing import Any
 
 from agentmailbus.net import ip_allowed, normalize_ip, tokens_equal
 from agentmailbus.protocol import (
+    BROADCAST,
     MAX_FRAME,
+    MAX_RECIPIENTS,
     ProtocolError,
     check_harness,
     check_id,
     check_name,
     check_priority,
+    check_recipient,
     check_text,
+    copy_id,
     dumps,
     loads,
 )
@@ -71,7 +75,7 @@ class Broker:
             try:
                 dropped = self.store.prune(self.retention_days)
                 if dropped:
-                    log.info("pruned %d finished messages", dropped)
+                    log.info("pruned %d finished messages and broadcast records", dropped)
             except Exception as exc:
                 log.warning("prune failed: %s", type(exc).__name__)
             await asyncio.sleep(PRUNE_INTERVAL)
@@ -255,7 +259,7 @@ class Broker:
         try:
             mid = check_id(raw_id)
             sender = check_name(msg.get("from"), "from")
-            recipient = check_name(msg.get("to"), "to")
+            recipient = check_recipient(msg.get("to"))
             text = check_text(msg.get("text"))
             priority = check_priority(msg.get("priority"))
         except ProtocolError as exc:
@@ -264,8 +268,15 @@ class Broker:
         if self.owner.get(sender) != relay_id:
             await ws.send(dumps({"type": "error", "id": mid, "error": "not-your-agent"}))
             return
+        if recipient == BROADCAST:
+            await self._broadcast(ws, mid, sender, text, priority)
+            return
         if not self.store.agent_known(recipient):
             await ws.send(dumps({"type": "error", "id": mid, "error": "unknown-agent"}))
+            return
+        if self.store.get_broadcast(mid) is not None:
+            # The id already names a broadcast.
+            await ws.send(dumps({"type": "error", "id": mid, "error": "id-conflict"}))
             return
         existing = self.store.get_message(mid)
         if existing is None:
@@ -291,8 +302,80 @@ class Broker:
             dumps({"type": "accepted", "id": mid, "to": recipient, "waiting": waiting})
         )
 
+    async def _broadcast(self, ws, mid: str, sender: str, text: str, priority: str) -> None:
+        """One ordinary message for every name online now, the sender excepted.
+
+        The broadcast is recorded first, so its id and sender are reserved even when
+        it reaches nobody, and a retry sends the text first given. Each copy has its
+        own id, made from the name and a salt only the broker knows, and from then on
+        is a direct message: per-name order, acks, retries and give-up all apply
+        unchanged. A retry reaches the names online at the retry, none of them twice.
+        A name that is offline when it is sent gets nothing from that send.
+        """
+        if self.store.get_message(mid) is not None:
+            # The id already names a direct message.
+            await ws.send(dumps({"type": "error", "id": mid, "error": "id-conflict"}))
+            return
+        cast = self.store.get_broadcast(mid)
+        if cast is not None and cast["sender"] != sender:
+            await ws.send(dumps({"type": "error", "id": mid, "error": "id-conflict"}))
+            return
+        names = sorted(
+            name for name, owner in self.owner.items() if name != sender and owner in self.conns
+        )
+        # The cap bounds the new copies one send makes; names that already have a copy
+        # do not count.
+        have = {c["recipient"] for c in self.store.broadcast_copies(mid)}
+        # Only these names may get a new copy in this send, whatever happens to the
+        # others' rows while it runs (a prune between pushes cannot raise the count).
+        missing = {name for name in names if name not in have}
+        if len(missing) > MAX_RECIPIENTS:
+            await ws.send(dumps({"type": "error", "id": mid, "error": "too-many-recipients"}))
+            return
+        if cast is None:
+            cast = self.store.insert_broadcast(mid, sender, text, priority)
+        for name in names:
+            dest = self.conns.get(self.owner.get(name, ""))
+            if dest is None:
+                # Went offline while an earlier copy was being pushed.
+                continue
+            cid = copy_id(cast["salt"], name)
+            existing = self.store.get_message(cid)
+            if existing is None:
+                if name not in missing:
+                    continue  # its copy was there when this send began
+                if self.store.get_broadcast(cid) is not None:
+                    log.warning("copy id %s of broadcast %s names a broadcast; skipping %s", cid, mid, name)
+                    continue
+                self.store.insert_message(
+                    cid, sender, name, cast["text"], cast["priority"], broadcast=mid
+                )
+                existing = self.store.get_message(cid)
+            elif existing["broadcast"] != mid:
+                log.warning("copy id %s of broadcast %s is taken; skipping %s", cid, mid, name)
+                continue
+            if existing is not None and existing["state"] == "queued":
+                try:
+                    await self._flush(dest, name)
+                except Exception:
+                    log.warning("push to %s failed", name)
+        # Every copy not given up on, from this call or an earlier one with this id.
+        copies = [c for c in self.store.broadcast_copies(mid) if c["state"] != "failed"]
+        recipients = [c["recipient"] for c in copies]
+        frame = {
+            "type": "accepted",
+            "id": mid,
+            "to": BROADCAST,
+            "recipients": recipients[:MAX_RECIPIENTS],
+            "waiting": any(c["state"] == "queued" for c in copies),
+        }
+        if len(recipients) > MAX_RECIPIENTS:
+            frame["more"] = len(recipients) - MAX_RECIPIENTS
+        await ws.send(dumps(frame))
+
+
 def _deliver_frame(row: dict) -> dict:
-    return {
+    frame = {
         "type": "deliver",
         "id": row["id"],
         "from": row["sender"],
@@ -302,3 +385,6 @@ def _deliver_frame(row: dict) -> dict:
         "priority": row["priority"],
         "ts": row["created_at"],
     }
+    if row.get("broadcast"):
+        frame["broadcast"] = row["broadcast"]
+    return frame

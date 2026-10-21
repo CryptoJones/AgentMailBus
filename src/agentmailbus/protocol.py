@@ -12,6 +12,11 @@ MAX_FRAME = 256 * 1024
 PRIORITIES = ("next", "now", "later")
 HARNESSES = ("claude", "dsh", "grok", "orca")
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# The recipient of a broadcast: every agent online when the broker accepts it.
+BROADCAST = "*"
+# One send of a broadcast makes at most this many new copies, which bounds the
+# work one frame can cause; the answer lists at most this many names.
+MAX_RECIPIENTS = 1000
 
 
 class ProtocolError(ValueError):
@@ -50,6 +55,21 @@ def check_name(value: object, field: str = "name") -> str:
     if not isinstance(value, str) or NAME.fullmatch(value) is None:
         raise ProtocolError("bad-name", field)
     return value
+
+
+def check_recipient(value: object) -> str:
+    """A name, or BROADCAST. `*` can never be a name, so the two cannot be confused."""
+    if value == BROADCAST:
+        return BROADCAST
+    return check_name(value, "to")
+
+
+def copy_id(salt: str, name: str) -> str:
+    """The id of one recipient's copy of a broadcast. The salt comes from the broker's
+    secret, the sender, and the broadcast id (store.broadcast_salt): the same
+    broadcast and name always give the same copy id, so a retry reaches nobody
+    twice, and nobody outside the broker can work a copy id out in advance."""
+    return str(uuid.uuid5(uuid.UUID(salt), name))
 
 
 def check_id(value: object) -> str:
