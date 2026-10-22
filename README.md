@@ -28,6 +28,7 @@ The relay registers each live session and delivers on the machine:
 | --- | --- |
 | claude | cc-socks. Auth line, then a user line. The peer token is read from the session's sessions directory (`~/.claude/sessions/`, or under `CLAUDE_CONFIG_DIR`). |
 | dsh | One JSON line on the inbox socket named in the binding. Confirm that frame on a live dsh before relying on it. |
+| opencode | One JSON line on the socket of the opencode plugin (`deploy/opencode/agentmailbus.js`), which puts the message into the session as a prompt. |
 | grok, orca | One JSON line appended to the wake file. A Grok session watches that file. There is no receive tool. |
 
 None of these sockets answer, so "delivered" means the bytes were written. PROTOCOL.md spells out what an ack does and does not promise. A delivery that fails is retried with backoff and given up after 20 attempts; `agentmailbus who` shows what is still pending and how many messages were given up on. One message is in flight per name at a time and the next goes out on its ack, so a fresh message never overtakes an older one for the same recipient; one that keeps failing holds the ones behind it until it succeeds or is given up on.
@@ -36,9 +37,9 @@ The broker database is the queue, not an archive: finished rows are deleted afte
 
 ## MCP
 
-`agentmailbus mcp` speaks stdio MCP and exposes two tools, `send(to, text, priority, id)` and `broadcast(text, priority, id)`. The sender name comes from `--from`, or for Claude from the session itself (see below); a Claude session that stays off the bus gets no tools. The model cannot supply a different sender through the tool. Any process running as the same user can, through the relay socket or `agentmailbus send`.
+`agentmailbus mcp` speaks stdio MCP and exposes two tools, `send(to, text, priority, id)` and `broadcast(text, priority, id)`. The sender name comes from `--from`, or for Claude and opencode from the session itself (see below); a Claude session that stays off the bus gets no tools. The model cannot supply a different sender through the tool. Any process running as the same user can, through the relay socket or `agentmailbus send`.
 
-Receiving is not a tool. Claude is injected through cc-socks. dsh is injected through its inbox socket. Grok is injected by a new line on the wake file.
+Receiving is not a tool. Claude is injected through cc-socks. dsh is injected through its inbox socket. opencode is injected by its plugin. Grok is injected by a new line on the wake file.
 
 Grok does not start a turn because a file grew. Start a `monitor` on the wake file before the session's MCP server registers, or the backlog that is flushed at registration is already in the file when the monitor starts:
 
@@ -110,11 +111,36 @@ Each session's tools start with "Your name on the bus is …", so the agent can 
 
 Only an interactive session joins. Claude Code writes a record for each session in `~/.claude/sessions/<pid>.json` (under `CLAUDE_CONFIG_DIR` when that is set); the server waits up to three seconds for it, and when there is none, or it says the session was started by a script (`claude -p` and the Agent SDK record an `sdk-…` entrypoint), the server answers with no tools and binds no name, and logs why. That holds even when `AGENTMAILBUS_NAME` is set, since a script inherits it from the session that started it. Claude Code records `sdk-cli` for a `claude -p` started from a terminal session; one started from inside an IDE or desktop session keeps that session's entrypoint, and so joins. A script that should be on the bus passes `--from` in its own MCP config. `--from` always wins and skips all of these checks.
 
-`AGENTMAILBUS_NAME` applies only to Claude; the other harnesses take `--from`.
+`AGENTMAILBUS_NAME` applies only to Claude and opencode; the other harnesses take `--from`.
 
-The server removes its binding when it exits, on SIGTERM and SIGHUP too. A binding left by a session that was killed is removed the next time an automatically named Claude session on the host starts. On Linux, an automatic binding (and a session record) whose pid now belongs to another process counts as dead. If an older config also starts `agentmailbus mcp --from …` for the same sessions, remove it, or each session joins twice under two names; one registered at user scope under the same name has to be removed first (`claude mcp remove -s user agentmailbus`).
+The server removes its binding when it exits, on SIGTERM and SIGHUP too. A binding left by a session that was killed is removed the next time an automatically named Claude or opencode session on the host starts. On Linux, an automatic binding (and a session record) whose pid now belongs to another process counts as dead. If an older config also starts `agentmailbus mcp --from …` for the same sessions, remove it, or each session joins twice under two names; one registered at user scope under the same name has to be removed first (`claude mcp remove -s user agentmailbus`).
 
 Claude Code starts MCP servers as its direct children, and the server takes its parent pid as the session. Register the command itself, not a shell or launcher that stays in between.
+
+An opencode session needs two pieces, both once per host. The plugin receives; the MCP server names the session and sends. Copy the plugin into opencode's plugin directory:
+
+```bash
+cp deploy/opencode/agentmailbus.js ~/.config/opencode/plugins/
+```
+
+and add the server to `~/.config/opencode/opencode.json` (or `.jsonc`), with the absolute path to `agentmailbus`:
+
+```json
+{
+  "mcp": {
+    "agentmailbus": {
+      "type": "local",
+      "command": ["/home/you/.local/share/agentmailbus/venv/bin/agentmailbus", "mcp", "--harness", "opencode"]
+    }
+  }
+}
+```
+
+Restart opencode. Each project folder an opencode process has open then joins under `AGENTMAILBUS_NAME` when that is set and no other running session or folder holds it, and otherwise under the folder's name, `oc` and eight hex digits made from the process (its pid and start time) and the folder, and the relay's host: `rea-oc1a2b3c4d.ronin28`. A later opencode that happens to reuse the pid gets another name, so it does not receive mail queued for the old one; the same holds for every restart, so give a folder that others write to regularly a fixed name with `AGENTMAILBUS_NAME`, set in the `environment` of the server's entry in the project's opencode config. A second opencode on the same project then takes an automatic name instead; a `--from` there would bind both windows to one name, and the first to close would take it off the bus. The broker must run this version before an opencode name can come online; an older one refuses it with `bad-harness`.
+
+A message goes to the session a person last sent a prompt to (messages from the bus do not count); before that, to the most recently updated session for the folder, which may be yesterday's and not the one on screen; with none, the plugin makes one called "AgentMailBus". A subagent's session is never the target. A message that arrives while the session is working waits for it, as a typed prompt does; `priority` has no effect. The model then runs a turn in that session with that session's permissions, whether or not anyone is looking at it.
+
+The plugin listens on `<data dir>/opencode/<pid>-<folder key>.sock`, where the data dir is `$XDG_DATA_HOME/agentmailbus` (`~/.local/share/agentmailbus` when that is unset, empty, or not an absolute path without `..` after a leading `~/` is expanded, on both sides; this rule now holds for the broker and relay too, so an install that set such a value finds its state under `~/.local/share/agentmailbus`) and the folder key is the first 12 hex digits of SHA-256 of the folder's real path. The directory must be its user's own and closed to everyone else, or the plugin does not listen. opencode starts the MCP server in the project's folder, as its child, so the server takes its parent pid and its working folder and binds the same path (register the command itself, not a shell or launcher that stays in between); the name is online once both are running. A name stays taken while its opencode process runs, even before the plugin listens. A scripted `opencode run` joins too, for as long as it runs. A socket left by an opencode that was killed is removed the next time an automatically named opencode session on the host starts. `--from` takes the same socket path for the folder it runs in; if you use it at all, put it in a project's opencode config, never the global one, where every folder would join under one name; `agentmailbus bind --harness opencode` takes it too, run in the project's folder and given the opencode process with `--pid`. The socket path must fit a Unix socket (103 bytes), which holds for a home directory up to about 40 characters; with a longer one, set a shorter `XDG_DATA_HOME`. Tested with opencode 1.19.3. A folder whose name is not valid UTF-8 is handled as the plugin sees it under Node; under opencode's Bun runtime that is untested. A message the plugin cannot put into a session (opencode refuses it) is logged in opencode's output and lost: the relay counted it delivered once the line was written.
 
 A Grok session:
 

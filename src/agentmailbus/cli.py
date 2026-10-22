@@ -21,7 +21,7 @@ from agentmailbus.omi import OmiMirror
 from agentmailbus.paths import data_dir
 from agentmailbus.adapters import wake_problem
 from agentmailbus.protocol import BROADCAST, ProtocolError, check_harness, check_name
-from agentmailbus.registry import load_live, remove_binding, save_binding
+from agentmailbus.registry import load_held, load_live, remove_binding, save_binding, start_time
 from agentmailbus.relay import Relay
 from agentmailbus.store import BrokerStore, SeenStore
 
@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> None:
     mcp.add_argument(
         "--from",
         dest="sender",
-        help="the session's name; for claude it may be left out, see README",
+        help="the session's name; for claude and opencode it may be left out, see README",
     )
     mcp.add_argument("--harness", required=True)
     mcp.add_argument(
@@ -79,7 +79,9 @@ def main(argv: list[str] | None = None) -> None:
     bind = sub.add_parser("bind", help="publish a live session name")
     bind.add_argument("name")
     bind.add_argument("--harness", required=True)
-    bind.add_argument("--pid", type=int, help="defaults to the calling process for grok, orca, claude")
+    bind.add_argument(
+        "--pid", type=int, help="defaults to the calling process for grok, orca, claude; required for opencode"
+    )
     bind.add_argument("--wake", default="")
     bind.add_argument("--socket", default="")
     bind.add_argument("--registry", type=Path)
@@ -140,7 +142,7 @@ def _default_pid(harness: str, pid: int | None) -> int:
         return pid
     if harness in {"grok", "orca"}:
         return os.getpid()
-    if harness == "claude":
+    if harness in {"claude", "opencode"}:
         return os.getppid()
     return 0
 
@@ -160,6 +162,12 @@ def _wake_arg(text: str, harness: str) -> str:
         raise ProtocolError("bad-wake", f"the wake path cannot be made absolute: {exc}") from None
 
 
+def _no_socket_for_opencode(args) -> None:
+    """The plugin listens only where it computes; a socket given here would never be live."""
+    if args.harness == "opencode" and args.socket:
+        raise SystemExit("--socket is not used with --harness opencode: the plugin's socket is derived")
+
+
 def _mcp(args) -> None:
     # SIGTERM and SIGHUP end the server through its cleanup, so the binding file goes.
     # The first one also ignores any that follow, so nothing cuts the cleanup short.
@@ -171,6 +179,7 @@ def _mcp(args) -> None:
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, _stop)
     harness = check_harness(args.harness)
+    _no_socket_for_opencode(args)
     pid = _default_pid(harness, args.pid)
     sock = _relay_socket(args.relay_socket)
     log = logging.getLogger("agentmailbus.mcp")
@@ -195,8 +204,15 @@ def _mcp(args) -> None:
             }
             if harness == "claude":
                 binding["sessions_dir"] = str(autoname.sessions_dir())
-            path = registry / f"{sender}.json"
-            _save_locked(registry, binding)
+            if harness == "opencode":
+                try:
+                    _opencode_defaults(binding, pid)
+                except (ProtocolError, OSError) as exc:
+                    log.warning("not joining the bus: %s", getattr(exc, "detail", "") or exc)
+                    binding, sender = None, None
+            if binding is not None:
+                path = registry / f"{sender}.json"
+                _save_locked(registry, binding)
         elif harness == "claude":
             session = autoname.read_session(pid)
             if not autoname.interactive(session):
@@ -208,7 +224,7 @@ def _mcp(args) -> None:
                         if lock.locked:
                             autoname.sweep_dead(registry)
                         sender = autoname.pick(
-                            pid, session, os.environ.get(autoname.ENV, ""), load_live(registry), args.relay_config
+                            pid, session, os.environ.get(autoname.ENV, ""), load_held(registry), args.relay_config
                         )
                         if sender is not None:
                             binding = {
@@ -228,6 +244,8 @@ def _mcp(args) -> None:
                 except TimeoutError:
                     log.warning("not joining the bus: the session registry stayed locked")
                     sender = None
+        elif harness == "opencode":
+            sender, binding, path = _opencode_auto(args, pid, registry, log)
         else:
             raise SystemExit("--from is required for this harness")
         if sender is not None:
@@ -240,6 +258,59 @@ def _mcp(args) -> None:
         # Only this server's own file. Another process may have bound the name since.
         if path is not None and binding is not None:
             _remove_locked(registry, path, binding)
+
+
+def _opencode_auto(args, pid: int, registry: Path, log) -> tuple[str | None, dict | None, Path | None]:
+    """Name opencode process `pid` and bind it to its plugin's socket. The binding is
+    live once the plugin listens there; the server does not wait for it."""
+    try:
+        with autoname.registry_lock(registry) as lock:
+            if lock.locked:
+                autoname.sweep_dead(registry)
+                autoname.sweep_opencode_sockets()
+            sender = autoname.opencode_name(
+                pid,
+                os.environ.get(autoname.ENV, ""),
+                load_held(registry),
+                args.relay_config,
+                os.getcwd(),
+            )
+            binding = {
+                "name": sender,
+                "harness": "opencode",
+                "pid": pid,
+                "wake": "",
+                "socket": "",
+                "server": os.getpid(),
+            }
+            _opencode_defaults(binding, pid)
+            path = registry / f"{sender}.json"
+            save_binding(registry, binding)
+    except TimeoutError:
+        log.warning("not joining the bus: the session registry stayed locked")
+        return None, None, None
+    except ProtocolError as exc:
+        log.warning("not joining the bus: %s", exc.detail or exc.code)
+        return None, None, None
+    except OSError as exc:  # the working folder is gone, or similar
+        log.warning("not joining the bus: %s", exc)
+        return None, None, None
+    if not os.path.exists(binding["socket"]):
+        log.info("waiting for the opencode plugin to listen on %s", binding["socket"])
+    return sender, binding, path
+
+
+def _opencode_defaults(binding: dict, pid: int) -> None:
+    """The plugin's socket for this process and folder (opencode starts the server in
+    the project's folder), and the start time, so a recycled pid is not this session."""
+    if not binding.get("socket"):
+        binding["socket"] = autoname.opencode_socket(pid, os.getcwd())
+    if len(os.fsencode(binding["socket"])) > autoname.MAX_SOCKET_PATH:
+        # The plugin will not listen there either; set a shorter XDG_DATA_HOME.
+        raise ProtocolError("bad-socket", f"the socket path {binding['socket']} is too long for a Unix socket")
+    # Clock ticks on Linux; elsewhere the `ps` start text, checked when names are chosen.
+    ticks = start_time(pid)
+    binding["proc_start"] = ticks if ticks is not None else (autoname.process_started(pid) or None)
 
 
 def _send(args) -> None:
@@ -307,6 +378,10 @@ def _remove_locked(registry: Path, path: Path, binding: dict) -> None:
 
 def _bind(args) -> None:
     harness = check_harness(args.harness)
+    _no_socket_for_opencode(args)
+    if harness == "opencode" and (args.pid is None or args.pid <= 0):
+        # The caller is a shell, not opencode: its pid is not the session's.
+        raise SystemExit("bind --harness opencode needs --pid <opencode pid>")
     pid = args.pid
     if pid is None and harness != "dsh":
         pid = os.getppid()
@@ -319,6 +394,8 @@ def _bind(args) -> None:
     }
     if harness == "claude":
         binding["sessions_dir"] = str(autoname.sessions_dir())
+    if harness == "opencode":
+        _opencode_defaults(binding, binding["pid"])
     path = _save_locked(_registry(args.registry), binding)
     print(path)
 

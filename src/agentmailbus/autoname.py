@@ -140,6 +140,123 @@ def auto_name(
     raise ProtocolError("name-taken", "every candidate name is held by another session")
 
 
+def folder_key(folder: str) -> str:
+    """Twelve hex digits of SHA-256 of the folder's real path. The plugin computes
+    the same from the `directory` opencode gives it."""
+    import hashlib
+
+    # The plugin sees the folder as text; bytes that are not UTF-8 reach it as U+FFFD.
+    seen = os.fsencode(os.path.realpath(folder)).decode("utf-8", "replace")
+    return hashlib.sha256(seen.encode("utf-8")).hexdigest()[:12]
+
+
+MAX_SOCKET_PATH = 103  # bytes: macOS allows 104 with the NUL, Linux 108
+
+
+def opencode_socket(pid: int, folder: str) -> str:
+    """Where the opencode plugin for process `pid` and project `folder` listens:
+    <data dir>/opencode/<pid>-<folder key>.sock. One opencode process can serve
+    several folders, and each gets its own socket and name."""
+    from agentmailbus.paths import data_dir
+
+    return str((data_dir() / "opencode" / f"{pid}-{folder_key(folder)}.sock").absolute())
+
+
+def process_started(pid: int) -> str:
+    """When `pid` started, as text: clock ticks on Linux, `ps -o lstart=` elsewhere,
+    "" when neither can be read."""
+    from agentmailbus.registry import start_time
+
+    ticks = start_time(pid)
+    if ticks is not None:
+        return str(ticks)
+    import subprocess
+
+    try:
+        # The same locale and zone wherever it runs, so the text compares.
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, check=False,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def opencode_tag(pid: int, folder: str) -> str:
+    """`oc` and eight hex digits from the process (pid and start time) and folder.
+    The broker keeps mail for a name it has seen, so a later process that reuses
+    the pid must not get the same name. With no start time to read, the tag is
+    random, and the name lasts only as long as this server."""
+    import hashlib
+    import uuid
+
+    started = process_started(pid) or uuid.uuid4().hex
+    key = f"{pid}:{started}:".encode() + os.fsencode(os.path.realpath(folder))
+    return "oc" + hashlib.sha256(key).hexdigest()[:8]
+
+
+def sweep_opencode_sockets(directory: Path | None = None) -> int:
+    """Remove plugin sockets (`<pid>-<folder key>.sock`) whose opencode process is
+    gone. opencode does not run the plugin's exit handler when a signal kills it."""
+    import stat
+
+    from agentmailbus.paths import data_dir
+    from agentmailbus.registry import pid_alive
+
+    gone = 0
+    for path in (directory or data_dir() / "opencode").glob("*.sock"):
+        try:
+            owner = int(path.stem.split("-", 1)[0])
+            if owner > 0 and not pid_alive(owner) and stat.S_ISSOCK(path.lstat().st_mode):
+                path.unlink()
+                gone += 1
+        except (ValueError, OSError):
+            continue
+    return gone
+
+
+def opencode_name(
+    pid: int, env_name: str, held: dict[str, dict], relay_config: Path, folder: str, socket_path: str = ""
+) -> str:
+    """The name for opencode process `pid` in `folder`: AGENTMAILBUS_NAME unless
+    another session holds it, else the folder's name and the process tag,
+    `rea-oc1a2b3c4d.ronin28`. `held` is every name a live process holds, live
+    or still waiting for its plugin. A holder is this session only when it has the
+    same process and the same socket: one opencode process serves several folders."""
+    socket_path = socket_path or opencode_socket(pid, folder)
+
+    def mine(holder: dict | None) -> bool:
+        return holder is None or (holder.get("pid") == pid and holder.get("socket") == socket_path)
+
+    if env_name:
+        name = check_name(env_name, ENV)
+        if mine(held.get(name)):
+            return name
+    base = clean(os.path.basename(os.path.realpath(folder))) or "opencode"
+    host = config_host(relay_config)
+    tag = opencode_tag(pid, folder)
+    for candidate in [tag] + [f"{tag}-{n}" for n in range(2, 100)]:
+        name = _tagged(base, candidate, host)
+        if mine(held.get(name)):
+            return check_name(name, "from")
+    raise ProtocolError("name-taken", "every candidate name is held by another session")
+
+
+def reused(pid: int, start: object, harness: str = "opencode") -> bool:
+    """True when `start` names another process than the one now at `pid`. On Linux
+    it is clock ticks; off Linux an opencode binding holds the `ps -o lstart=` text,
+    which costs a `ps` and so is checked only here, not on every liveness scan. A
+    Claude binding's start time is Claude Code's own and is judged as before."""
+    from agentmailbus.registry import started_elsewhen
+
+    if harness == "opencode" and isinstance(start, str) and start and not start.isdigit():
+        now = process_started(pid)
+        return bool(now) and now != start
+    return started_elsewhen(pid, start)
+
+
 def claude_socket_from(session: dict) -> str:
     """The socket path Claude Code reports for the session, when it reports one."""
     path = session.get("messagingSocketPath")
@@ -200,20 +317,21 @@ class registry_lock:
 
 
 def sweep_dead(directory: Path) -> int:
-    """Remove Claude bindings whose session process is gone, and temporary files
-    of writers that died. Run under the registry lock. Returns how many went."""
-    from agentmailbus.registry import pid_alive, started_elsewhen
+    """Remove Claude and opencode bindings whose session process is gone, and
+    temporary files of writers that died. Run under the registry lock. Returns how
+    many went."""
+    from agentmailbus.registry import pid_alive
 
     gone = 0
     for path in directory.glob("*.json"):
         try:
             data = json.loads(path.read_text())
-            if not isinstance(data, dict) or data.get("harness") != "claude":
+            if not isinstance(data, dict) or data.get("harness") not in {"claude", "opencode"}:
                 continue
             owner = int(data.get("pid") or 0)
         except (OSError, ValueError, TypeError, OverflowError):
             continue
-        if owner > 0 and (not pid_alive(owner) or started_elsewhen(owner, data.get("proc_start"))):
+        if owner > 0 and (not pid_alive(owner) or reused(owner, data.get("proc_start"), data["harness"])):
             path.unlink(missing_ok=True)
             gone += 1
     for path in directory.glob(".*.json.*.tmp"):
