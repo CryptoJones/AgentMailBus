@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+_warned: set[str] = set()
 
 
 def private_dir(path: Path) -> Path:
@@ -46,5 +49,19 @@ def private_dir(path: Path) -> Path:
 
 
 def data_dir() -> Path:
-    base = os.environ.get("XDG_DATA_HOME", "~/.local/share")
-    return Path(base).expanduser() / "agentmailbus"
+    """$XDG_DATA_HOME/agentmailbus. A leading `~/` is expanded; then, as the XDG spec
+    says, a value that is empty or not an absolute path is ignored. The opencode
+    plugin computes the same path."""
+    raw = os.environ.get("XDG_DATA_HOME", "")
+    base = os.path.expanduser(raw) if raw == "~" or raw.startswith("~/") else raw
+    if base.startswith("//"):
+        base = "/" + base.lstrip("/")  # as the plugin's path.join has it
+    # `..` resolves through symlinks here and as text in the opencode plugin; neither uses it.
+    if not os.path.isabs(base) or ".." in base.split("/"):
+        if raw and raw not in _warned:
+            _warned.add(raw)
+            logging.getLogger("agentmailbus").warning(
+                "XDG_DATA_HOME=%r is not an absolute path without '..'; using ~/.local/share", raw
+            )
+        base = os.path.expanduser("~/.local/share")
+    return Path(base) / "agentmailbus"

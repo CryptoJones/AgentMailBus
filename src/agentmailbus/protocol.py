@@ -10,7 +10,7 @@ from typing import Any
 MAX_TEXT = 32_000
 MAX_FRAME = 256 * 1024
 PRIORITIES = ("next", "now", "later")
-HARNESSES = ("claude", "dsh", "grok", "orca")
+HARNESSES = ("claude", "dsh", "grok", "opencode", "orca")
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # The recipient of a broadcast: every agent online when the broker accepts it.
 BROADCAST = "*"

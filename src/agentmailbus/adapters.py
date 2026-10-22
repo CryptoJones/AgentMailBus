@@ -85,9 +85,10 @@ def _attr(value: object) -> str:
     return re.sub(r'[^A-Za-z0-9-]', "", str(value))
 
 
-def claude_frames(binding: dict, message: dict) -> list[bytes]:
-    sock_path = binding.get("socket") or claude_socket(int(binding["pid"]))
-    body = (
+def wrapped(message: dict) -> str:
+    """The message as a session reads it: the text inside a tag that names the
+    sender, which the text itself cannot close or forge."""
+    return (
         '<cross-session-message from="{host}" from-name="{name}" from-mode="agentmailbus"{extra}>\n'
         "{text}\n"
         "</cross-session-message>"
@@ -97,6 +98,11 @@ def claude_frames(binding: dict, message: dict) -> list[bytes]:
         extra=' broadcast="{}"'.format(_attr(message["broadcast"])) if message.get("broadcast") else "",
         text=escape_text(message["text"]),
     )
+
+
+def claude_frames(binding: dict, message: dict) -> list[bytes]:
+    sock_path = binding.get("socket") or claude_socket(int(binding["pid"]))
+    body = wrapped(message)
     user = {
         "type": "user",
         "message": {"content": body},
@@ -670,11 +676,34 @@ def deliver_dsh(binding: dict, message: dict) -> bool:
     return True
 
 
+def opencode_frame(message: dict) -> bytes:
+    """One JSON line for the opencode plugin (deploy/opencode/agentmailbus.js).
+    `content` is what the plugin puts in the session, wrapped as for Claude; the
+    sender and a broadcast id are in the wrapper, and the plugin reads nothing else."""
+    return _line({"type": "user", "id": message["id"], "content": wrapped(message)})
+
+
+def deliver_opencode(binding: dict, message: dict) -> bool:
+    sock_path = binding.get("socket")
+    if not isinstance(sock_path, str) or not sock_path:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.connect(sock_path)
+            sock.sendall(opencode_frame(message))
+            sock.shutdown(socket.SHUT_WR)
+    except OSError:
+        return False
+    return True
+
+
 def default_adapters() -> dict:
     return {
         "claude": deliver_claude,
         "dsh": deliver_dsh,
         "grok": deliver_wake,
+        "opencode": deliver_opencode,
         "orca": deliver_wake,
     }
 
