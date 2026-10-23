@@ -381,7 +381,7 @@ def test_cli_send_refuses_a_star(tmp_path: Path) -> None:
          "--relay-socket", str(tmp_path / "none.sock")],
         capture_output=True, timeout=30, check=False,
     )
-    assert out.returncode != 0 and b"bad-name: send takes one name" in out.stderr and b"message id" in out.stderr
+    assert out.returncode != 0 and b"bad-name (message id" in out.stderr and b"this attempt sent nothing): send takes one name" in out.stderr
 
 
 def test_a_prune_during_a_retry_does_not_raise_the_copy_count(tmp_path: Path) -> None:
@@ -440,7 +440,7 @@ def test_cli_failure_names_the_id_to_retry_with(monkeypatch) -> None:
     try:
         cli.main(["broadcast", "--from", "a", "--text", "x"])
     except SystemExit as exc:
-        assert str(exc) == f"too-many-recipients (message id {mid})"
+        assert str(exc) == f"too-many-recipients (message id {mid}; this send made no new copies, retry with this id once fewer agents are online)"
     else:
         raise AssertionError("no failure")
 
@@ -458,7 +458,7 @@ def test_cli_makes_the_id_so_a_relay_failure_still_names_it(monkeypatch) -> None
     try:
         cli.main(["broadcast", "--from", "a", "--text", "x"])
     except SystemExit as exc:
-        assert str(exc) == f"timeout (message id {seen['id']})"
+        assert str(exc) == f"timeout (message id {seen['id']}; outcome unknown, retry with this id)"
         assert str(uuid.UUID(seen["id"])) == seen["id"]
     else:
         raise AssertionError("no failure")
@@ -487,7 +487,7 @@ def test_cli_names_the_id_when_the_relay_socket_fails(monkeypatch) -> None:
     try:
         cli.main(["broadcast", "--from", "a", "--text", "x"])
     except SystemExit as exc:
-        assert str(exc) == f"relay-down: TimeoutError (message id {seen['id']})"
+        assert str(exc).startswith(f"relay-down: TimeoutError (message id {seen['id']}; outcome unknown, retry with --id {seen['id']})")
     else:
         raise AssertionError("no failure")
 
@@ -528,7 +528,7 @@ def test_cli_names_the_id_for_text_that_cannot_be_encoded(monkeypatch) -> None:
     try:
         cli.main(["broadcast", "--from", "a", "--text", "\udcff", "--id", mid, "--relay-socket", "/nonexistent.sock"])
     except SystemExit as exc:
-        assert str(exc) == f"bad-text (message id {mid})"
+        assert str(exc) == f"bad-text (message id {mid}; this attempt sent nothing): --text holds bytes that are not valid text"
     else:
         raise AssertionError("no failure")
 
@@ -558,6 +558,6 @@ def test_cli_names_the_id_for_any_undecodable_argument(monkeypatch) -> None:
         try:
             cli.main(argv + ["--id", mid])
         except SystemExit as exc:
-            assert str(exc) == f"{code} (message id {mid})"
+            assert str(exc).startswith(f"{code} (message id {mid}; this attempt sent nothing): --")
         else:
             raise AssertionError("no failure")

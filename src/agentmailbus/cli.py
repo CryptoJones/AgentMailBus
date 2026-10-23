@@ -15,7 +15,7 @@ from pathlib import Path
 from agentmailbus import __version__, autoname
 from agentmailbus.broker import Broker
 from agentmailbus.localcall import local_rpc
-from agentmailbus.mcp import serve_stdio
+from agentmailbus.mcp import named_error, serve_stdio
 from agentmailbus.net import DEFAULT_ALLOW, load_secret, parse_allow
 from agentmailbus.omi import OmiMirror
 from agentmailbus.paths import data_dir
@@ -317,7 +317,9 @@ def _send(args) -> None:
     # The id is made first, so every failure below names the id to retry with.
     mid = args.id or str(uuid.uuid4())
     if args.cmd == "send" and args.to == BROADCAST:
-        raise SystemExit(f"bad-name: send takes one name; use `agentmailbus broadcast` (message id {mid})")
+        raise SystemExit(
+            f"bad-name (message id {mid}; this attempt sent nothing): send takes one name; use `agentmailbus broadcast`"
+        )
     payload = {
         "op": "send",
         "from": args.sender,
@@ -326,22 +328,40 @@ def _send(args) -> None:
         "priority": args.priority,
         "id": mid,
     }
-    for field in ("from", "to", "text", "priority"):
+    for field in ("from", "to", "text", "priority", "id"):
         try:
             payload[field].encode("utf-8")
         except UnicodeEncodeError:
             # Bytes the shell could not decode; nothing is sent.
+            if field == "id":
+                raise SystemExit(
+                    "bad-id (this attempt sent no message): --id holds bytes that are not valid text; "
+                    "retry with a UUID as the id or with no id"
+                ) from None
             code = "bad-text" if field == "text" else f"bad-{field}"
-            raise SystemExit(f"{code} (message id {mid})") from None
+            raise SystemExit(
+                f"{code} (message id {mid}; this attempt sent nothing): --{field} "
+                "holds bytes that are not valid text"
+            ) from None
+    sock = _relay_socket(args.relay_socket)
     try:
-        result = local_rpc(_relay_socket(args.relay_socket), payload)
+        result = local_rpc(sock, payload)
     except (OSError, ProtocolError) as exc:
-        # The send may have reached the broker; the same id is the safe retry.
         why = exc.code if isinstance(exc, ProtocolError) else type(exc).__name__
-        raise SystemExit(f"relay-down: {why} (message id {mid})") from None
+        # These three fail at connect, before anything is written.
+        if isinstance(exc, (FileNotFoundError, ConnectionRefusedError)):
+            sent, hint = "this attempt sent no message", f"no relay is listening at {sock} (is the relay running, and is that the right socket?)"
+        elif isinstance(exc, PermissionError):
+            sent, hint = "this attempt sent no message", f"this user may not open {sock}; run as the relay's user"
+        else:
+            # The send may have reached the broker; the same id is the safe retry.
+            sent, hint = "outcome unknown", "this host's relay did not answer cleanly"
+        raise SystemExit(f"relay-down: {why} (message id {mid}; {sent}, retry with --id {mid}): {hint}") from None
     if not result.get("ok"):
         # The id is the one to retry with, so it is part of the message.
-        raise SystemExit(f"{result.get('error') or 'send-failed'} (message id {result.get('id') or payload['id']})")
+        code = str(result.get("error") or "send-failed")
+        reason = str(result.get("reason") or "")
+        raise SystemExit(named_error(code, str(result.get("id") or mid), _cli_hints(args.sender), reason))
     if "recipients" in result:
         names = result.get("recipients") or []
         more = result.get("more") or 0
@@ -351,6 +371,21 @@ def _send(args) -> None:
         return
     state = "queued" if result.get("waiting") else "accepted"
     print(f"{result.get('id', '')} {state}")
+
+
+def _cli_hints(sender: str) -> dict[str, str]:
+    """What to do about a refused send, said for someone at a shell."""
+    return {
+        "sender-offline": (
+            f"'{sender}' is not a live name on this host (never bound, or its process or socket is gone, "
+            f"or its wake path is unusable); bind it with `agentmailbus bind --harness HARNESS {sender} ...` "
+            "(grok and orca also need --wake, dsh --socket, opencode --pid; see `agentmailbus bind --help`), "
+            "then retry with --id; a retry with that id is the same message, not a copy"
+        ),
+        "not-registered": "the broker has not accepted this name; retry with --id in a moment",
+        "broker-down": "this host's relay has no broker connection; retry with --id once `agentmailbus who` succeeds",
+        "unknown-agent": "no agent by that name has ever registered; `agentmailbus who` lists the names the broker knows",
+    }
 
 
 def _save_locked(registry: Path, binding: dict) -> Path:

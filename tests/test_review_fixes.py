@@ -123,7 +123,7 @@ def test_mcp_retry_reuses_the_id() -> None:
         rpc,
     )
     assert seen == [mid, mid]
-    assert replies[2]["result"]["content"][0]["text"] == "bad-id"
+    assert replies[2]["result"]["content"][0]["text"] == "bad-id (message id nope; this attempt sent no message, retry with a UUID as the id or with no id)"
     # Every failure after the id exists names it, whatever the relay said.
     failed = _mcp_session(
         [{"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}}],
@@ -145,7 +145,7 @@ def test_mcp_retry_reuses_the_id() -> None:
         [{"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "send", "arguments": {"to": "a", "text": "t", "id": mid}}}],
         lambda payload: {"ok": False, "error": "not-registered"},
     )
-    assert moment[0]["result"]["content"][0]["text"] == f"not-registered (message id {mid}; outcome unknown, retry with this id)"
+    assert moment[0]["result"]["content"][0]["text"] == f"not-registered (message id {mid}; this attempt sent no message, retry with this id): the broker has not accepted this session's name"
     # A reply whose id cannot be UTF-8 is escaped, not a crash.
     odd = _mcp_session([{"jsonrpc": "2.0", "id": "\ud800", "method": "ping"}], lambda p: {})
     assert odd[0]["id"] == "\ud800" and odd[0]["result"] == {}
