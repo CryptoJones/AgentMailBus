@@ -40,8 +40,9 @@ class BrokerRefused(RuntimeError):
 
 
 class LocalError(Exception):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, reason: str = "") -> None:
         self.code = code
+        self.reason = reason
         super().__init__(code)
 
 
@@ -74,6 +75,10 @@ class Relay:
         self.waiters: dict[str, asyncio.Future] = {}
         self.registered: dict[str, dict] = {}
         self.rejected: set[str] = set()
+        # Register replies still owed to attempts that timed out, per name. Replies
+        # come back in order, so the next one for that name belongs to the dead attempt.
+        self.reg_late: dict[str, int] = {}
+        self.reg_timeout = 5.0
         self.reg_lock = asyncio.Lock()
         # One delivery queue and worker per name, so a slow delivery for one name
         # never holds another name's message past the broker's deadline.
@@ -145,6 +150,7 @@ class Relay:
         self.ws = ws
         self.registered.clear()
         self.rejected.clear()
+        self.reg_late.clear()
         async with self.send_lock:
             await ws.send(
                 dumps({"type": "hello", "v": 1, "host": self.host_id, "token": self.token})
@@ -241,11 +247,15 @@ class Relay:
         for binding in pending:
             await self._register(binding)
 
-    async def _register(self, binding: dict) -> None:
+    async def _register(self, binding: dict) -> str:
+        """Register one name. Returns "" once it is registered, else why not:
+        the broker's error code, `no-answer`, or `broker-down`."""
         name = binding["name"]
         async with self.reg_lock:
-            if name in self.registered or self.ws is None:
-                return
+            if name in self.registered:
+                return ""
+            if self.ws is None:
+                return "broker-down"
             loop = asyncio.get_running_loop()
             fut: asyncio.Future = loop.create_future()
             self.waiters[f"reg:{name}"] = fut
@@ -256,21 +266,32 @@ class Relay:
                     )
             except Exception:
                 self.waiters.pop(f"reg:{name}", None)
-                return
-            try:
-                msg = await asyncio.wait_for(fut, 5)
-            except asyncio.TimeoutError:
+                return "broker-down"
+            # asyncio.wait leaves the future alone on timeout, so a reply that lands
+            # as the timer fires is still read here instead of being thrown away.
+            await asyncio.wait({fut}, timeout=self.reg_timeout)
+            if not fut.done():
+                # Nothing runs between these lines, so the reply is truly still owed.
                 self.waiters.pop(f"reg:{name}", None)
+                self.reg_late[name] = self.reg_late.get(name, 0) + 1
                 log.warning("no answer from the broker registering %s", name)
-                return
+                return "no-answer"
+            msg = fut.result()
             if msg.get("type") == "registered":
                 self.registered[name] = binding
                 if name in self.rejected:
                     self.rejected.discard(name)
                 log.info("registered %s (%s)", name, binding["harness"])
-            elif name not in self.rejected:
+                return ""
+            why = str(msg.get("error") or "rejected")
+            if why == "broker-down":
+                # The link dropped while waiting (_fail_waiters); not a refusal.
+                log.warning("broker link dropped while registering %s", name)
+                return why
+            if name not in self.rejected:
                 self.rejected.add(name)
-                log.warning("broker rejected %s: %s", name, msg.get("error", "rejected"))
+                log.warning("broker rejected %s: %s", name, why)
+            return why
 
     async def _read(self, ws) -> None:
         async for raw in ws:
@@ -284,7 +305,12 @@ class Relay:
                 continue
             key = None
             if kind in {"registered", "error"} and msg.get("name"):
-                key = f"reg:{msg['name']}"
+                name = str(msg["name"])
+                if self.reg_late.get(name):
+                    # The answer to an attempt that already gave up: not this one's.
+                    self.reg_late[name] -= 1
+                    continue
+                key = f"reg:{name}"
             elif msg.get("id"):
                 key = str(msg["id"])
             if key and key in self.waiters:
@@ -414,10 +440,12 @@ class Relay:
             raise LocalError("sender-offline")
         if self.ws is None:
             raise LocalError("broker-down")
+        why = ""
         if sender not in self.registered:
-            await self._register(live[sender])
+            why = await self._register(live[sender])
         if sender not in self.registered:
-            raise LocalError("not-registered")
+            # Say why, so a refusal that waiting cannot fix (name-taken) is told apart.
+            raise LocalError("not-registered", why)
         if mid in self.waiters:
             # The same id is already on the wire; a second caller would steal its reply.
             raise LocalError("in-flight")
@@ -448,6 +476,10 @@ class Relay:
             self.waiters.pop(mid, None)
             raise LocalError("timeout") from None
         if msg.get("type") != "accepted":
+            if msg.get("error") == "not-your-agent":
+                # The broker does not count this relay as the owner (the link or the
+                # binding changed during the send): register before the next try.
+                self.registered.pop(sender, None)
             return {"ok": False, "id": mid, "error": msg.get("error", "rejected")}
         out = {"ok": True, "id": mid, "waiting": bool(msg.get("waiting"))}
         if "recipients" in msg:
@@ -500,6 +532,8 @@ class Relay:
                 out = {"ok": False, "error": "bad-op"}
         except LocalError as exc:
             out = {"ok": False, "error": exc.code}
+            if exc.reason:
+                out["reason"] = exc.reason
         except ProtocolError as exc:
             out = {"ok": False, "error": exc.code}
         except ValueError:

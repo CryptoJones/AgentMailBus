@@ -141,7 +141,7 @@ def _call(mid, params: dict, sender: str | None, rpc) -> dict:
     try:
         msg_id = check_id(args["id"]) if args.get("id") else str(uuid.uuid4())
     except ProtocolError as exc:
-        return _tool_error(mid, exc.code)
+        return _tool_error(mid, named_error(exc.code, str(args.get("id"))[:64]))
     # From here on the id exists, and every failure names it.
     try:
         # `send` takes a name only, so a broadcast is always asked for by name.
@@ -149,20 +149,20 @@ def _call(mid, params: dict, sender: str | None, rpc) -> dict:
             # A model that names a recipient did not mean everyone.
             return _tool_error(
                 mid,
-                f"bad-arguments (message id {msg_id}; nothing was sent): broadcast takes no `to`, "
+                f"bad-arguments (message id {msg_id}; this attempt sent nothing): broadcast takes no `to`, "
                 "use send to reach one agent",
             )
         if tool == "send" and args.get("to") == BROADCAST:
             return _tool_error(
                 mid,
-                f"bad-name (message id {msg_id}; nothing was sent): send takes one name, "
+                f"bad-name (message id {msg_id}; this attempt sent nothing): send takes one name, "
                 "use the broadcast tool to reach every agent",
             )
         recipient = BROADCAST if tool == "broadcast" else check_name(args.get("to"), "to")
         text = check_text(args.get("text"))
         priority = check_priority(args.get("priority"))
     except ProtocolError as exc:
-        return _tool_error(mid, _named(exc.code, msg_id))
+        return _tool_error(mid, named_error(exc.code, msg_id))
     payload = {
         "op": "send",
         "id": msg_id,
@@ -176,10 +176,11 @@ def _call(mid, params: dict, sender: str | None, rpc) -> dict:
     except (OSError, ProtocolError, ValueError) as exc:
         # The relay is down or restarting. The tool fails; the server stays up.
         log.warning("relay call failed: %s", type(exc).__name__)
-        return _tool_error(mid, _named("relay-down", msg_id))
+        return _tool_error(mid, named_error("relay-down", msg_id))
     if not isinstance(result, dict) or not result.get("ok"):
         code = str(result.get("error") or "send-failed") if isinstance(result, dict) else "send-failed"
-        return _tool_error(mid, _named(code, msg_id))
+        reason = str(result.get("reason") or "") if isinstance(result, dict) else ""
+        return _tool_error(mid, named_error(code, msg_id, reason=reason))
     if tool == "broadcast":
         names = result.get("recipients") or []
         who = ", ".join(names) if names else "reached nobody"
@@ -207,12 +208,57 @@ TERMINAL = {
 }
 
 
-def _named(code: str, msg_id: str) -> str:
+# This attempt left nothing stored or delivered: refused by this host's relay before
+# the message went to the broker (a not-registered attempt may have sent a register
+# frame), or, for not-your-agent, refused by the broker before storing it. The same id is still the right
+# retry. An earlier attempt with the same id may have got through, so the wording
+# speaks of this attempt only.
+NOT_SENT = {"sender-offline", "not-registered", "not-your-agent"}
+
+# Said whoever is asking, since the code alone does not say what happened.
+COMMON_HINTS = {
+    "not-your-agent": "the broker does not count this host's relay as the name's owner right now (the broker link "
+    "or the name's binding changed during the send); the relay registers the name again on the next try",
+}
+
+# What to do about a refusal, for the codes where the code alone does not say.
+MCP_HINTS = {
+    "sender-offline": (
+        "this session has no live binding on this host (its binding, process, or socket is gone); "
+        "restarting the session binds it again, perhaps under a new name"
+    ),
+    "not-registered": "the broker has not accepted this session's name",
+}
+
+# Why the broker would not take a name, as the relay reports it with not-registered.
+REFUSALS = {
+    "name-taken": "the broker refused the name (name-taken): a relay on another host that is still connected holds it; "
+    "stop that session or use a different name; until then a retry is refused the same way",
+    "no-answer": "the broker did not answer the registration; retry with this id in a moment",
+    "broker-down": "this host's relay lost its broker connection while registering the name",
+}
+
+
+def named_error(code: str, msg_id: str, hints: dict[str, str] | None = None, reason: str = "") -> str:
+    """The error text for a failed send: the code, the id, whether to retry, and a hint."""
+    hint = (hints if hints is not None else MCP_HINTS).get(code) or COMMON_HINTS.get(code)
+    if code == "not-registered" and reason:
+        hint = REFUSALS.get(reason, f"the broker refused the name ({reason}); the relay log has details")
+    tail = f": {hint}" if hint else ""
+    if code == "in-flight":
+        return (
+            f"{code} (message id {msg_id}; an earlier send with this id is still in progress and its outcome "
+            f"is unknown, retry with this id shortly){tail}"
+        )
+    if code == "bad-id":
+        return f"{code} (message id {msg_id}; this attempt sent no message, retry with a UUID as the id or with no id){tail}"
+    if code in NOT_SENT:
+        return f"{code} (message id {msg_id}; this attempt sent no message, retry with this id){tail}"
     if code == "too-many-recipients":
-        return f"{code} (message id {msg_id}; this send made no new copies, retry with this id once fewer agents are online)"
+        return f"{code} (message id {msg_id}; this send made no new copies, retry with this id once fewer agents are online){tail}"
     if code in TERMINAL:
-        return f"{code} (message id {msg_id}; not retryable as is, send a new message with a new id)"
-    return f"{code} (message id {msg_id}; outcome unknown, retry with this id)"
+        return f"{code} (message id {msg_id}; not retryable as is, send a new message with a new id){tail}"
+    return f"{code} (message id {msg_id}; outcome unknown, retry with this id){tail}"
 
 
 def _tool_error(mid, code: str) -> dict:
