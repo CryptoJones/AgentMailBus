@@ -151,6 +151,50 @@ class Broker:
             if owner == relay_id:
                 del self.owner[name]
 
+    async def _status(self, ws, relay_id: str, msg: dict) -> None:
+        """Where one message stands, per recipient, never with its text. The
+        sender's relay sees every recipient; a recipient's relay sees only the rows
+        for names it holds now, so one broadcast recipient cannot watch the others."""
+        try:
+            mid = check_id(msg.get("message"))
+        except ProtocolError as exc:
+            await ws.send(dumps({"type": "error", "id": msg.get("id"), "error": exc.code}))
+            return
+        receipt = self.store.receipt(mid)
+        if receipt is not None and relay_id not in {receipt["from_host"], self.owner.get(receipt["sender"])}:
+            mine = {name for name, owner in self.owner.items() if owner == relay_id}
+            receipt = self.store.receipt(mid, only=mine)
+            if receipt is not None and not receipt["recipients"]:
+                receipt = None
+        if receipt is None:
+            await ws.send(dumps({"type": "error", "id": msg.get("id"), "error": "unknown-message"}))
+            return
+        recipients = [
+            {
+                "name": r["recipient"],
+                "state": r["state"],
+                "attempts": r["attempts"],
+                "delivered_at": r["delivered_at"],
+                "finished_at": r["finished_at"],
+            }
+            for r in receipt["recipients"]
+        ]
+        await ws.send(
+            dumps(
+                {
+                    "type": "status",
+                    "id": msg.get("id"),
+                    "message": mid,
+                    "kind": receipt["kind"],
+                    "broadcast": receipt["broadcast"],
+                    "from": receipt["sender"],
+                    "created_at": receipt["created_at"],
+                    "recipients": recipients,
+                    "more": receipt["more"],
+                }
+            )
+        )
+
     def _owns_message(self, relay_id: str, mid: str) -> bool:
         """Only the relay that holds the recipient may ack or nack a message."""
         row = self.store.get_message(mid) if mid else None
@@ -186,6 +230,8 @@ class Broker:
             for name, owner in list(self.owner.items()):
                 if owner == relay_id:
                     await self._flush(ws, name)
+        elif kind == "status":
+            await self._status(ws, relay_id, msg)
         elif kind == "directory":
             await ws.send(
                 dumps(

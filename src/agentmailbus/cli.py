@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import asyncio
 import logging
 import os
@@ -91,6 +92,12 @@ def main(argv: list[str] | None = None) -> None:
     unbind.add_argument("name")
     unbind.add_argument("--registry", type=Path)
     unbind.set_defaults(func=_unbind)
+
+    status = sub.add_parser("status", help="show where one message stands, per recipient")
+    status.add_argument("--id", required=True, help="the message id a send or broadcast printed")
+    status.add_argument("--json", action="store_true", help="print the receipt as JSON")
+    status.add_argument("--relay-socket", type=Path)
+    status.set_defaults(func=_status)
 
     who = sub.add_parser("who", help="list agents the broker knows")
     who.add_argument("--relay-socket", type=Path)
@@ -443,6 +450,73 @@ def _unbind(args) -> None:
             path.unlink(missing_ok=True)
     except TimeoutError:
         raise SystemExit("the session registry stayed locked; nothing was removed") from None
+
+
+STATUS_HINTS = {
+    "unknown-message": "the broker has no record of this id that this host may see: it was never accepted, it "
+    "finished more than retention_days ago and was pruned, or this host neither sent it nor holds a recipient",
+    "bad-type": "the broker is older than this relay and cannot give receipts; update it",
+    "bad-id": "the id must be a UUID, as printed by send or broadcast",
+    "broker-down": "this host's relay has no broker connection; try again once `agentmailbus who` succeeds",
+    "timeout": "the broker did not answer in time; try again",
+}
+
+
+def _receipt_line(r: dict) -> str:
+    """One recipient's line. Each state says only what the broker knows."""
+    state = str(r.get("state"))
+    name = r.get("name")
+    attempts = r.get("attempts") or 0
+    handed = r.get("delivered_at") or ""
+    if state == "acked":
+        what = "written by the recipient's relay (not necessarily read)"
+        if r.get("finished_at"):
+            what += f"; ack recorded at {r['finished_at']}"
+    elif state == "delivered":
+        what = "handed to the recipient's relay, no ack yet"
+        if handed:
+            what += f" (handed out at {handed})"
+    elif state == "queued" and handed:
+        what = (
+            f"waiting to be sent again (last hand-out at {handed}; the recipient's relay may already have written it"
+            + (f"; {attempts} attempts so far)" if attempts else ")")
+        )
+    elif state == "queued":
+        what = "waiting"
+        if attempts:
+            what += f" ({attempts} attempts so far)"
+    elif state == "failed":
+        what = f"given up at {r.get('finished_at')} after {attempts} attempts (a late ack can still mark it written)"
+    else:
+        what = state
+    return f"{name}\t{state}\t{what}"
+
+
+def _status(args) -> None:
+    sock = _relay_socket(args.relay_socket)
+    try:
+        result = local_rpc(sock, {"op": "status", "id": args.id})
+    except (OSError, ProtocolError) as exc:
+        why = exc.code if isinstance(exc, ProtocolError) else type(exc).__name__
+        raise SystemExit(f"relay-down: {why}: could not ask the relay at {sock}") from None
+    if not result.get("ok"):
+        code = str(result.get("error") or "status-failed")
+        hint = STATUS_HINTS.get(code)
+        raise SystemExit(f"{code} (message id {args.id[:64]})" + (f": {hint}" if hint else ""))
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    head = f"{result.get('id')} {result.get('kind')} from {result.get('from')} at {result.get('created_at')}"
+    if result.get("kind") == "copy":
+        head += f" (a copy of broadcast {result.get('broadcast')})"
+    print(head)
+    recipients = result.get("recipients") or []
+    for r in recipients:
+        print(_receipt_line(r))
+    if result.get("more"):
+        print(f"... and {result['more']} more")
+    if not recipients and not result.get("more"):
+        print("no copies: nobody else was online when it was sent")
 
 
 def _who(args) -> None:
