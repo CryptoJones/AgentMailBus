@@ -38,6 +38,16 @@ def _before(days: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="microseconds")
 
 
+def _receipt_row(row) -> dict:
+    out = dict(row)
+    # delivered_at carries a claim counter after "/" for requeue matching; a receipt
+    # shows only the time.
+    out["delivered_at"] = str(out.get("delivered_at") or "").split("/", 1)[0]
+    out.pop("from_host", None)
+    out.pop("broadcast", None)
+    return out
+
+
 def backoff(attempts: int) -> float:
     return min(float(2**attempts), MAX_BACKOFF)
 
@@ -94,7 +104,8 @@ class BrokerStore:
                 text TEXT NOT NULL,
                 priority TEXT NOT NULL,
                 salt TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                from_host TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -125,6 +136,17 @@ class BrokerStore:
         )
         if "broadcast" not in cols:
             self.conn.execute("ALTER TABLE messages ADD COLUMN broadcast TEXT NOT NULL DEFAULT ''")
+        bcols = {row["name"] for row in self.conn.execute("PRAGMA table_info(broadcasts)")}
+        if "from_host" not in bcols:
+            # The sending relay, so receipts can tell it from the recipients' relays
+            # even for a broadcast with no copies. Older rows take their first copy's.
+            self.conn.execute("ALTER TABLE broadcasts ADD COLUMN from_host TEXT NOT NULL DEFAULT ''")
+            self.conn.execute(
+                """
+                UPDATE broadcasts SET from_host=COALESCE(
+                    (SELECT from_host FROM messages WHERE broadcast=broadcasts.id ORDER BY rowid LIMIT 1), '')
+                """
+            )
         # After the column exists, so an older database can take it.
         self.conn.execute("CREATE INDEX IF NOT EXISTS messages_b ON messages(broadcast)")
         self.conn.execute(
@@ -203,8 +225,8 @@ class BrokerStore:
         """Record a broadcast before any copy is made, so its id and sender are
         reserved even when it reaches nobody, and a retry reuses its text."""
         self.conn.execute(
-            "INSERT INTO broadcasts(id, sender, text, priority, salt, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (broadcast_id, sender, text, priority, self.broadcast_salt(broadcast_id, sender), _now()),
+            "INSERT INTO broadcasts(id, sender, text, priority, salt, created_at, from_host) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (broadcast_id, sender, text, priority, self.broadcast_salt(broadcast_id, sender), _now(), self.host_of(sender)),
         )
         self.conn.commit()
         row = self.get_broadcast(broadcast_id)
@@ -235,6 +257,49 @@ class BrokerStore:
             (broadcast_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def receipt(self, mid: str, limit: int = 1000, only: set[str] | None = None) -> dict | None:
+        """Where a message stands, per recipient, without its text: one row for a
+        direct message or a broadcast copy's own id, one per copy for a broadcast id.
+        `only` keeps the rows for those recipients. None once the broker has no
+        record of it (never sent, or pruned after retention_days)."""
+        cols = "recipient, sender, from_host, state, attempts, created_at, delivered_at, finished_at"
+        row = self.conn.execute(f"SELECT {cols}, broadcast FROM messages WHERE id=?", (mid,)).fetchone()
+        if row is not None:
+            rows = [_receipt_row(row)] if only is None or row["recipient"] in only else []
+            return {
+                "kind": "copy" if row["broadcast"] else "direct",
+                "broadcast": row["broadcast"],
+                "sender": row["sender"],
+                "from_host": row["from_host"],
+                "created_at": row["created_at"],
+                "recipients": rows,
+                "more": 0,
+            }
+        record = self.get_broadcast(mid)
+        where, args = "broadcast=?", [mid]
+        if only is not None:
+            names = sorted(only)
+            where += f" AND recipient IN ({','.join('?' * len(names))})" if names else " AND 0"
+            args += names
+        rows = self.conn.execute(
+            f"SELECT {cols} FROM messages WHERE {where} ORDER BY recipient LIMIT ?", (*args, limit)
+        ).fetchall()
+        first = self.conn.execute(
+            f"SELECT {cols} FROM messages WHERE broadcast=? ORDER BY rowid LIMIT 1", (mid,)
+        ).fetchone()
+        if record is None and first is None:
+            return None
+        total = self.conn.execute(f"SELECT COUNT(*) FROM messages WHERE {where}", args).fetchone()[0]
+        return {
+            "kind": "broadcast",
+            "broadcast": mid,
+            "sender": record["sender"] if record else first["sender"],
+            "from_host": (record["from_host"] if record else "") or (first["from_host"] if first else ""),
+            "created_at": record["created_at"] if record else first["created_at"],
+            "recipients": [_receipt_row(r) for r in rows],
+            "more": max(0, total - len(rows)),
+        }
 
     def get_message(self, mid: str) -> dict | None:
         row = self.conn.execute("SELECT rowid, * FROM messages WHERE id=?", (mid,)).fetchone()

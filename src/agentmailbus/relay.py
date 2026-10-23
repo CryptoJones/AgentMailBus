@@ -489,6 +489,42 @@ class Relay:
                 out["more"] = msg["more"]
         return out
 
+    async def local_status(self, message_id) -> dict:
+        """Ask the broker where one message stands, per recipient."""
+        message_id = check_id(message_id)
+        if self.ws is None:
+            raise LocalError("broker-down")
+        rid = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self.waiters[rid] = fut
+        try:
+            async with self.send_lock:
+                await self.ws.send(dumps({"type": "status", "id": rid, "message": message_id}))
+        except Exception:
+            self.waiters.pop(rid, None)
+            raise LocalError("broker-down") from None
+        try:
+            msg = await asyncio.wait_for(fut, 5)
+        except asyncio.TimeoutError:
+            self.waiters.pop(rid, None)
+            raise LocalError("timeout") from None
+        if msg.get("type") != "status":
+            # An older broker answers bad-type: it cannot give receipts.
+            return {"ok": False, "id": message_id, "error": str(msg.get("error") or "status-failed")}
+        return {
+            "ok": True,
+            "id": message_id,
+            "kind": msg.get("kind"),
+            "broadcast": msg.get("broadcast") or "",
+            "from": msg.get("from"),
+            "created_at": msg.get("created_at"),
+            "recipients": [r for r in msg.get("recipients") or [] if isinstance(r, dict)]
+            if isinstance(msg.get("recipients"), list)
+            else [],
+            "more": msg.get("more") if type(msg.get("more")) is int else 0,
+        }
+
     async def local_who(self) -> dict:
         if self.ws is None:
             return {
@@ -528,6 +564,9 @@ class Relay:
             elif op == "who":
                 out = await self.local_who()
                 out["op"] = "who"
+            elif op == "status":
+                out = await self.local_status(msg.get("id"))
+                out["op"] = "status"
             else:
                 out = {"ok": False, "error": "bad-op"}
         except LocalError as exc:
